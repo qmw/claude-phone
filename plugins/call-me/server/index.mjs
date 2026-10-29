@@ -18,7 +18,8 @@ import {
   buildSayHangupTwiml,
   buildInboundTwiml,
   offlineUrl,
-  samePhone,
+  allowedCaller,
+  machineName,
   REJECT_TWIML,
   validSignature,
   TERMINAL_STATUSES,
@@ -29,7 +30,7 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -94,9 +95,9 @@ async function startServer(cfg) {
       return res.end(buildSayHangupTwiml(profile, profile.ack));
     }
 
-    // Inbound: only the user's own phone may talk to the session.
+    // Inbound: only the user's own phones may talk to the session.
     const profile = speechProfile(cfg);
-    if (!samePhone(params.From, cfg.CALL_ME_TO_NUMBER)) {
+    if (!allowedCaller(cfg, params.From)) {
       log(`rejected inbound call from ${params.From}`);
       return res.end(REJECT_TWIML);
     }
@@ -120,6 +121,8 @@ async function startServer(cfg) {
         content,
         meta: {
           from: params.From,
+          to: params.To || cfg.TWILIO_FROM_NUMBER,
+          machine: machineName(cfg),
           language: profile.language,
           confidence: params.Confidence ? Number(params.Confidence).toFixed(2) : "unknown",
           call_sid: params.CallSid,

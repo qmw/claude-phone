@@ -27,6 +27,8 @@ function startServer(extraEnv = {}) {
       CALL_ME_TO_NUMBER: ME,
       CALL_ME_LANGUAGE: "pl-PL",
       CALL_ME_INBOUND: "1",
+      CALL_ME_MACHINE: "laptop",
+      CALL_ME_ALLOWED_CALLERS: "+48600000001",
       CALL_ME_PUBLIC_URL: BASE,
       CALL_ME_PORT: String(PORT),
       CALL_ME_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cm-state-")),
@@ -89,7 +91,12 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
     const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
     assert.equal(ev.content, "Odpal testy");
-    assert.deepEqual(ev.meta, { from: ME, language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0" });
+    assert.deepEqual(ev.meta, {
+      from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0",
+    });
+
+    // A second phone on the allow-list gets through too.
+    assert.match((await webhook("/incoming", { From: "+48600000001", CallSid: "CAin2" })).body, /<Gather/);
 
     // Outbound call in English although the default is Polish.
     s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Tests passed.", language: "en-US" } } });

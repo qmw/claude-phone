@@ -158,6 +158,15 @@ export function offlineUrl(p) {
 /** E.164 comparison tolerant of spaces/dashes. */
 export const samePhone = (a, b) => !!a && !!b && a.replace(/[^\d+]/g, "") === b.replace(/[^\d+]/g, "");
 
+/** Inbound callers allowed to talk to the session: CALL_ME_TO_NUMBER plus CALL_ME_ALLOWED_CALLERS (comma-separated). */
+export function allowedCaller(cfg, from) {
+  const allowed = [cfg.CALL_ME_TO_NUMBER, ...(cfg.CALL_ME_ALLOWED_CALLERS || "").split(",")];
+  return allowed.some((n) => samePhone(from, n.trim()));
+}
+
+/** Name of this machine, reported with inbound calls so the session knows which number was dialled. */
+export const machineName = (cfg) => cfg.CALL_ME_MACHINE || os.hostname();
+
 /** https://www.twilio.com/docs/usage/webhooks/webhooks-security */
 export function twilioSignature(authToken, url, params) {
   const data = Object.keys(params)

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   parseEnv, loadConfig, buildCallTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
-  normalizeLanguage, speechProfile, offlineUrl, samePhone,
+  normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName,
   classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
 } from "../plugins/call-me/server/lib.mjs";
 
@@ -69,6 +69,20 @@ test("samePhone ignores formatting", () => {
   assert.ok(samePhone("+48 500-000-001", "+48500000001"));
   assert.ok(!samePhone("+48500000002", "+48500000001"));
   assert.ok(!samePhone(undefined, "+48500000001"));
+});
+
+test("allowedCaller accepts CALL_ME_TO_NUMBER and CALL_ME_ALLOWED_CALLERS", () => {
+  const cfg = { CALL_ME_TO_NUMBER: "+48500000001", CALL_ME_ALLOWED_CALLERS: "+48 600 000 001, +12025550100" };
+  assert.ok(allowedCaller(cfg, "+48500000001"));
+  assert.ok(allowedCaller(cfg, "+48600000001"));
+  assert.ok(allowedCaller(cfg, "+12025550100"));
+  assert.ok(!allowedCaller(cfg, "+48600000002"));
+  assert.ok(!allowedCaller({ CALL_ME_TO_NUMBER: "+48500000001" }, "+48600000001"));
+});
+
+test("machineName defaults to the hostname", () => {
+  assert.equal(machineName({ CALL_ME_MACHINE: "laptop" }), "laptop");
+  assert.ok(machineName({}).length > 0);
 });
 
 test("twilio signature matches Twilio's documented example", () => {

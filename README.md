@@ -77,11 +77,31 @@ Use it like `claude`, e.g. `claude-phone --resume <session-id>`. Channels can on
 A `claude-phone` session:
 
 1. Points your Twilio number's voice webhook at itself. The most recently started `claude-phone` session wins.
-2. Answers calls **only from `CALL_ME_TO_NUMBER`**. Any other caller is rejected.
+2. Answers calls **only from `CALL_ME_TO_NUMBER`** and the numbers in `CALL_ME_ALLOWED_CALLERS`. Any other caller is rejected.
 3. Greets you, transcribes what you say in `CALL_ME_LANGUAGE`, and pushes it into the session. Claude treats it as your request and calls you back with `call_me` when it's done or needs a decision.
 4. On exit, points the number back to a short "Claude is offline" message, hosted on Twilio Twimlets. That message is also set as the fallback, so it plays even if a session crashes.
 
 Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary `claude` sessions never touch the number.
+
+Each channel event carries `from` (your phone), `to` (the Twilio number you dialled) and `machine` (`CALL_ME_MACHINE`, or the hostname by default).
+
+## Several machines
+
+Give each machine **its own Twilio number**. You then dial the machine you want, and its calls to you show its number. Every number can live on the same Twilio account, but a trial account allows only one number.
+
+On each extra machine:
+
+1. Give the machine access to this private repo: copy or create the `github-qmw` SSH key and the `Host github-qmw` entry in `~/.ssh/config`, or add a read-only deploy key to the repo.
+2. Install the plugin the same way: `claude plugin marketplace add …` and `claude plugin install …`.
+3. Write `~/.config/claude-call-me/config.env`. Use the same `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, but a different `TWILIO_FROM_NUMBER`. Set `CALL_ME_MACHINE` to a name you'll recognise.
+4. Optionally set a different `CALL_ME_TO_NUMBER` per machine, for example a work SIM. Put any other phones you call from in `CALL_ME_ALLOWED_CALLERS`.
+5. Create the `claude-phone` launcher there as well.
+
+Saved messages and do-not-disturb are per machine. Rejecting a call from machine A doesn't hold calls from machine B.
+
+Don't run `claude-phone` on two machines with the **same** Twilio number: the session started last takes it over.
+
+**Cost tip:** Twilio numbers in your own country make calling Claude a domestic call. A Polish geographic number is about $3 a month, and calls to it fall under unlimited domestic minutes. Calling a US number from Poland is billed as international. Polish numbers need a Twilio regulatory bundle: an ID, plus an address in the area of the number's prefix.
 
 ## Config
 
@@ -90,7 +110,9 @@ Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary 
 | `TWILIO_ACCOUNT_SID` | ✓ | |
 | `TWILIO_AUTH_TOKEN` | ✓ | |
 | `TWILIO_FROM_NUMBER` | ✓ | Your Twilio number, E.164 format |
-| `CALL_ME_TO_NUMBER` | ✓ | Your phone, E.164 format |
+| `CALL_ME_TO_NUMBER` | ✓ | Your phone, E.164 format. Claude calls it, and it may call in |
+| `CALL_ME_ALLOWED_CALLERS` | | More phones that may call in, comma-separated E.164 |
+| `CALL_ME_MACHINE` | | Name of this machine, reported with inbound calls (default: hostname) |
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
 | `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
