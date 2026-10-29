@@ -95,7 +95,8 @@ export function normalizeLanguage(x) {
 export function speechProfile(cfg, requested) {
   const def = normalizeLanguage(cfg.CALL_ME_LANGUAGE) || "en-US";
   const language = normalizeLanguage(requested) || def;
-  const p = { ...LANGUAGES[language], language };
+  // Seconds of silence that end the user's turn. Twilio's "auto" cut people off at their first pause.
+  const p = { ...LANGUAGES[language], language, speechTimeout: xmlEscape(cfg.CALL_ME_SPEECH_TIMEOUT || "3") };
   if (language === def) {
     if (cfg.CALL_ME_VOICE) p.voice = cfg.CALL_ME_VOICE;
     if (cfg.CALL_ME_INTRO !== undefined) p.intro = cfg.CALL_ME_INTRO;
@@ -108,7 +109,7 @@ export function speechProfile(cfg, requested) {
 const XML = `<?xml version="1.0" encoding="UTF-8"?>`;
 const say = (p, text) => `<Say voice="${xmlEscape(p.voice)}" language="${p.language}">${xmlEscape(text)}</Say>`;
 const gather = (p, url, inner, input = "speech dtmf", onEmpty = false) =>
-  `<Gather input="${input}" action="${xmlEscape(url)}" method="POST" timeout="10" speechTimeout="auto" ` +
+  `<Gather input="${input}" action="${xmlEscape(url)}" method="POST" timeout="10" speechTimeout="${p.speechTimeout}" ` +
   `actionOnEmptyResult="${onEmpty}" language="${p.language}">${inner}</Gather>`;
 
 /** TwiML for the outbound call. If gatherUrl is set, listen for a spoken / keypad reply. */

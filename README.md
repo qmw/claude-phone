@@ -94,6 +94,7 @@ Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary 
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
 | `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
+| `CALL_ME_SPEECH_TIMEOUT` | | Seconds of silence that end your turn when speaking (default 3) |
 | `CALL_ME_RETRIES` | | Extra attempts when you don't pick up (default 4) |
 | `CALL_ME_RETRY_DELAY` | | Seconds between attempts (default 90) |
 | `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |

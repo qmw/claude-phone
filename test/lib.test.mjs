@@ -30,6 +30,8 @@ test("twiml escapes message and includes gather only when replying", () => {
   const twoWay = buildCallTwiml("hi", speechProfile({ CALL_ME_LANGUAGE: "pl-PL" }), "https://x/gather/1?a=1&b=2");
   assert.match(twoWay, /<Gather [^>]*action="https:\/\/x\/gather\/1\?a=1&amp;b=2"/);
   assert.match(twoWay, /language="pl-PL"/);
+  assert.match(twoWay, /speechTimeout="3"/);
+  assert.match(buildCallTwiml("hi", speechProfile({ CALL_ME_SPEECH_TIMEOUT: "5" }), "https://x/g"), /speechTimeout="5"/);
   assert.match(twoWay, /Nie dosłyszałem/);
   assert.doesNotMatch(twoWay, /didn't catch/);
 });
