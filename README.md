@@ -47,11 +47,15 @@ It returns one of:
 
 ## Calling Claude (inbound)
 
-This uses Claude Code [channels](https://code.claude.com/docs/en/channels), a research preview that lets an MCP server push messages into a running session. call-me isn't on Anthropic's approved channel list, so it has to be loaded as a development channel. Add an alias to `~/.bashrc`:
+This uses Claude Code [channels](https://code.claude.com/docs/en/channels), a research preview that lets an MCP server push messages into a running session. call-me isn't on Anthropic's approved channel list, so it has to be loaded as a development channel. Create a launcher at `~/.local/bin/claude-phone`, then `chmod +x` it:
 
 ```bash
-alias claude-phone='CALL_ME_INBOUND=1 claude --dangerously-load-development-channels plugin:call-me@claude-call-me'
+#!/usr/bin/env bash
+export CALL_ME_INBOUND=1
+exec claude --dangerously-load-development-channels plugin:call-me@claude-call-me "$@"
 ```
+
+Use it like `claude`, e.g. `claude-phone --resume <session-id>`. Channels can only be enabled when a session starts, so a session already running under plain `claude` must be restarted this way.
 
 A `claude-phone` session:
 
@@ -73,7 +77,7 @@ Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary 
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
 | `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
-| `CALL_ME_INBOUND` | | `1` = take over the number and answer calls (set by the `claude-phone` alias) |
+| `CALL_ME_INBOUND` | | `1` = take over the number and answer calls (set by the `claude-phone` launcher) |
 | `CALL_ME_PUBLIC_URL` | | Use your own public URL instead of cloudflared |
 | `CALL_ME_PORT` | | Local webhook port (default: random) |
 
