@@ -22,9 +22,14 @@ import {
   REJECT_TWIML,
   validSignature,
   TERMINAL_STATUSES,
+  classifyOutcome,
+  RETRYABLE,
+  saveForCallback,
+  takeSaved,
+  dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -49,6 +54,7 @@ async function twilio(cfg, method, resource, form) {
 // ---------------------------------------------------- webhook server + tunnel
 
 const pending = new Map(); // callId -> { resolve, profile }
+const heardSaved = new Map(); // inbound CallSid -> saved messages read to the user on that call
 let webhook = null; // { port, publicUrl }
 
 function readBody(req) {
@@ -94,19 +100,33 @@ async function startServer(cfg) {
       log(`rejected inbound call from ${params.From}`);
       return res.end(REJECT_TWIML);
     }
-    if (url.pathname === "/incoming") return res.end(buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`));
-    if (params.SpeechResult) {
+    if (url.pathname === "/incoming") {
+      // The user calling in is also "calling back": read saved messages and end do-not-disturb.
+      const saved = takeSaved();
+      if (saved.length) heardSaved.set(params.CallSid, saved);
+      return res.end(buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`, saved));
+    }
+    const saved = heardSaved.get(params.CallSid) || [];
+    heardSaved.delete(params.CallSid);
+    if (params.SpeechResult || saved.length) {
       log(`inbound message from ${params.From}`);
+      let content = params.SpeechResult || "(the user said nothing after hearing the saved messages)";
+      if (saved.length)
+        content +=
+          "\n\nBefore speaking, the user heard these saved messages from earlier unanswered calls " +
+          "(route any answer to the session working in that project):\n" +
+          saved.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n");
       notify("notifications/claude/channel", {
-        content: params.SpeechResult,
+        content,
         meta: {
           from: params.From,
           language: profile.language,
           confidence: params.Confidence ? Number(params.Confidence).toFixed(2) : "unknown",
           call_sid: params.CallSid,
+          saved_messages_heard: String(saved.length),
         },
       });
-      return res.end(buildSayHangupTwiml(profile, profile.inboundAck));
+      return res.end(buildSayHangupTwiml(profile, params.SpeechResult ? profile.inboundAck : profile.inboundEmpty));
     }
     res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
   });
@@ -238,13 +258,22 @@ process.on("exit", () => tunnelProc?.kill());
 
 // ------------------------------------------------------------------ the tool
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language }) {
-  const { cfg, missing } = loadConfig();
-  if (missing.length)
-    throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
-  if (!message || !String(message).trim()) throw new Error("message is required");
-  const profile = speechProfile(cfg, language);
+const RESULT = {
+  rejected:
+    "The user REJECTED the call (it went to their voicemail; nothing was left there). Do NOT call again. " +
+    "The message was saved and will be read to the user when they call back; until then further call_me calls only save messages. " +
+    "Carry on without their answer if you can, otherwise wait for them.",
+  exhausted: (n) =>
+    `The user did not pick up after ${n} attempt(s) (probably busy or away). The message was saved and will be read to them when they call back. ` +
+    "Do not keep calling; carry on without their answer if you can.",
+  dnd: "Not called: the user rejected an earlier call and has not called back yet. The message was saved and will be read to them when they call back.",
+  short: "The user picked up and hung up immediately; they probably did not hear the message.",
+  failed: "Call failed.",
+  canceled: "Call was canceled.",
+};
 
+/** One outbound call attempt. Returns { outcome, reply, sid }. */
+async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds) {
   const callId = crypto.randomBytes(16).toString("hex");
   let gatherUrl = null;
   let replyPromise = new Promise(() => {});
@@ -254,47 +283,89 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
     replyPromise = new Promise((resolve) => pending.set(callId, { resolve, profile }));
   }
 
+  const amd = cfg.CALL_ME_AMD !== "0";
   const call = await twilio(cfg, "POST", "Calls.json", {
     To: cfg.CALL_ME_TO_NUMBER,
     From: cfg.TWILIO_FROM_NUMBER,
     Twiml: buildCallTwiml(message, profile, gatherUrl),
     Timeout: "30",
+    ...(amd ? { MachineDetection: "Enable", MachineDetectionTimeout: "8" } : {}),
   });
   log(`placed call ${call.sid}`);
 
   const deadline = Date.now() + timeout_seconds * 1000;
   let reply = null;
-  let status = call.status;
+  let c = call;
   replyPromise.then((r) => (reply = r));
   try {
     while (Date.now() < deadline) {
-      await Promise.race([replyPromise, sleep(2000)]);
+      await Promise.race([replyPromise, sleep(1000)]);
       if (reply) break;
-      status = (await twilio(cfg, "GET", `Calls/${call.sid}.json`)).status;
-      if (TERMINAL_STATUSES.has(status)) break;
+      c = await twilio(cfg, "GET", `Calls/${call.sid}.json`);
+      // Voicemail picked up (= the user rejected the call): hang up before leaving a message.
+      if (/^(machine|fax)/.test(c.answered_by || "") && !TERMINAL_STATUSES.has(c.status)) {
+        await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
+        c = { ...c, status: "completed" };
+        break;
+      }
+      if (TERMINAL_STATUSES.has(c.status)) break;
     }
   } finally {
     pending.delete(callId);
   }
-
-  if (!reply && !TERMINAL_STATUSES.has(status)) {
+  if (reply) return { outcome: "answered", reply, sid: call.sid };
+  if (!TERMINAL_STATUSES.has(c.status)) {
     await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
-    status = "timed-out";
+    return { outcome: "timed-out", sid: call.sid };
+  }
+  const outcome = classifyOutcome({ status: c.status, answeredBy: amd ? c.answered_by || "unknown" : null, duration: c.duration });
+  return { outcome, sid: call.sid };
+}
+
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false }) {
+  const { cfg, missing } = loadConfig();
+  if (missing.length)
+    throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
+  if (!message || !String(message).trim()) throw new Error("message is required");
+  const profile = speechProfile(cfg, language);
+  const entry = { message, language: profile.language, project: path.basename(process.cwd()), cwd: process.cwd() };
+  const dndMinutes = Number(cfg.CALL_ME_DND_MINUTES ?? 120);
+
+  if (!force && dndActive()) {
+    saveForCallback(entry);
+    return RESULT.dnd;
   }
 
-  if (reply) {
-    if (reply.speech) return `User replied by voice: "${reply.speech}"` + (reply.confidence != null ? ` (confidence ${reply.confidence.toFixed(2)})` : "");
-    return `User pressed keys: ${reply.digits}`;
+  const maxRetries = Math.max(0, Number(retries ?? cfg.CALL_ME_RETRIES ?? 4));
+  const delay = Number(cfg.CALL_ME_RETRY_DELAY ?? 90) * 1000;
+  let r;
+  for (let attempt = 0; ; attempt++) {
+    r = await placeCall(cfg, profile, message, wait_for_reply, timeout_seconds);
+    log(`attempt ${attempt + 1}: ${r.outcome}`);
+    if (!RETRYABLE.has(r.outcome) || attempt >= maxRetries) break;
+    await sleep(delay);
+    if (dndActive()) break; // rejected another session's call meanwhile
   }
-  const human = {
-    completed: wait_for_reply ? "Call was answered but the user gave no reply." : "Call completed; message was delivered.",
-    busy: "User's line was busy.",
-    "no-answer": "User did not answer.",
-    failed: "Call failed.",
-    canceled: "Call was canceled.",
-    "timed-out": `No reply within ${timeout_seconds}s; call was ended.`,
-  };
-  return `${human[status] || `Call ended with status ${status}.`} (call ${call.sid})`;
+
+  const tag = ` (call ${r.sid})`;
+  switch (r.outcome) {
+    case "answered":
+      if (r.reply?.speech)
+        return `User replied by voice: "${r.reply.speech}"` + (r.reply.confidence != null ? ` (confidence ${r.reply.confidence.toFixed(2)})` : "") + tag;
+      if (r.reply?.digits) return `User pressed keys: ${r.reply.digits}${tag}`;
+      return (wait_for_reply ? "Call was answered but the user gave no reply." : "Call answered; message was delivered.") + tag;
+    case "rejected":
+      saveForCallback(entry, { dndMinutes });
+      return RESULT.rejected + tag;
+    case "no-answer":
+    case "busy":
+      saveForCallback(entry);
+      return RESULT.exhausted(maxRetries + 1) + tag;
+    case "timed-out":
+      return `No reply within ${timeout_seconds}s; call was ended.${tag}`;
+    default:
+      return (RESULT[r.outcome] || `Call ended with status ${r.outcome}.`) + tag;
+  }
 }
 
 const TOOLS = [
@@ -305,13 +376,18 @@ const TOOLS = [
       "Use when the user asked to be called, when a long-running task finishes or fails and they asked to be notified, " +
       "or when you are blocked on a decision and the user said they may be away from the screen. " +
       "Keep the message short and speakable (no code, URLs, or markdown). If you need a decision, phrase it as a question with simple options. " +
-      "Write the message in the call's language.",
+      "Write the message in the call's language. " +
+      "Rules (enforced by the tool): an unanswered or busy call is retried automatically (default 4 more times, 90 s apart); " +
+      "if the user rejects the call, it is not retried and later calls are held until the user calls back; " +
+      "undelivered messages are saved and read to the user when they call in. Never loop on this tool yourself.",
     inputSchema: {
       type: "object",
       properties: {
         message: { type: "string", description: "What to say on the call. Plain spoken sentences, ideally under ~60 words." },
         wait_for_reply: { type: "boolean", description: "Listen for and return the user's reply (default true). Set false for a one-way notification.", default: true },
         timeout_seconds: { type: "number", description: "Max seconds to wait for the call to finish (default 180).", default: 180 },
+        retries: { type: "number", description: "Extra attempts if the user doesn't pick up (default 4, 90 s apart). Use 0 for anything not worth repeating." },
+        force: { type: "boolean", description: "Call even though the user rejected an earlier call. Only when the user explicitly asked to be called now." },
         language: {
           type: "string",
           enum: ["en-US", "pl-PL"],

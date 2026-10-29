@@ -45,6 +45,23 @@ It returns one of:
 - the keys you pressed
 - a status: no answer, busy, or no reply
 
+## Call rules
+
+Every session follows these rules, because the plugin enforces them rather than Claude:
+
+| What happens | Twilio sees | Rule |
+| --- | --- | --- |
+| You answer | `completed`, answered by a human | Deliver the message and return your reply. |
+| You don't pick up, or you're on another call | `no-answer` after 30 s of ringing, or `busy` | Retry every 90 s, up to 4 more times (`CALL_ME_RETRIES`, `CALL_ME_RETRY_DELAY`). If none succeed, save the message for your callback. |
+| You **reject** the call | Your carrier sends rejected calls straight to voicemail, so Twilio sees a call answered by a machine (answering machine detection) | Hang up without leaving a voicemail and **don't retry**. Save the message and start **do-not-disturb**: further `call_me` calls from any session only save their messages, until you call back or `CALL_ME_DND_MINUTES` (120) pass. |
+| You pick up and hang up at once (detection off) | `completed`, under 3 s | Reported as "probably didn't hear it". |
+
+**Calling back** ends do-not-disturb. The `claude-phone` session first reads you every saved message, each in its own language and prefixed with its project, then listens as usual. The session receives what you said plus the list of messages you heard, so it can route your answer to the right project.
+
+Saved messages and the do-not-disturb state live in `~/.local/state/claude-call-me/state.json`, shared by all sessions. Claude can pass `force: true` to override do-not-disturb, but only when you explicitly ask to be called now. `retries: 0` turns off retries for a single call.
+
+These rules were tested on a Polish mobile carrier. If your carrier reports a rejected call as `busy` instead of sending it to voicemail, rejections are treated like a busy line and retried.
+
 ## Calling Claude (inbound)
 
 This uses Claude Code [channels](https://code.claude.com/docs/en/channels), a research preview that lets an MCP server push messages into a running session. call-me isn't on Anthropic's approved channel list, so it has to be loaded as a development channel. Create a launcher at `~/.local/bin/claude-phone`, then `chmod +x` it:
@@ -77,6 +94,11 @@ Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary 
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
 | `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
+| `CALL_ME_RETRIES` | | Extra attempts when you don't pick up (default 4) |
+| `CALL_ME_RETRY_DELAY` | | Seconds between attempts (default 90) |
+| `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |
+| `CALL_ME_AMD` | | `0` turns off answering machine detection, which costs about $0.0075 per call. Rejections then can't be detected. |
+| `CALL_ME_STATE_DIR` | | Where saved messages are kept (default `~/.local/state/claude-call-me`) |
 | `CALL_ME_INBOUND` | | `1` = take over the number and answer calls (set by the `claude-phone` launcher) |
 | `CALL_ME_PUBLIC_URL` | | Use your own public URL instead of cloudflared |
 | `CALL_ME_PORT` | | Local webhook port (default: random) |

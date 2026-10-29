@@ -8,6 +8,10 @@ export const CONFIG_PATH =
   process.env.CALL_ME_CONFIG ||
   path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "claude-call-me", "config.env");
 
+export const STATE_DIR =
+  process.env.CALL_ME_STATE_DIR ||
+  path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "claude-call-me");
+
 export const REQUIRED_KEYS = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "CALL_ME_TO_NUMBER"];
 
 /** Parse KEY=VALUE lines (with optional quotes and # comments). */
@@ -54,6 +58,8 @@ export const LANGUAGES = {
     inboundAck: "Got it, passing it on. Goodbye.",
     inboundEmpty: "I didn't hear anything. Goodbye.",
     offline: "Claude is offline right now. Goodbye.",
+    savedIntro: (n) => (n === 1 ? "You have one saved message." : `You have ${n} saved messages.`),
+    savedFrom: (project) => `From ${project}:`,
   },
   "pl-PL": {
     voice: "Polly.Ewa",
@@ -66,6 +72,8 @@ export const LANGUAGES = {
     inboundAck: "Przyjąłem, przekazuję. Do usłyszenia.",
     inboundEmpty: "Nic nie usłyszałem. Do usłyszenia.",
     offline: "Claude jest teraz offline. Do usłyszenia.",
+    savedIntro: (n) => (n === 1 ? "Masz jedną zapisaną wiadomość." : `Zapisane wiadomości: ${n}.`),
+    savedFrom: (project) => `Z projektu ${project}:`,
   },
 };
 
@@ -99,9 +107,9 @@ export function speechProfile(cfg, requested) {
 
 const XML = `<?xml version="1.0" encoding="UTF-8"?>`;
 const say = (p, text) => `<Say voice="${xmlEscape(p.voice)}" language="${p.language}">${xmlEscape(text)}</Say>`;
-const gather = (p, url, inner, input = "speech dtmf") =>
+const gather = (p, url, inner, input = "speech dtmf", onEmpty = false) =>
   `<Gather input="${input}" action="${xmlEscape(url)}" method="POST" timeout="10" speechTimeout="auto" ` +
-  `actionOnEmptyResult="false" language="${p.language}">${inner}</Gather>`;
+  `actionOnEmptyResult="${onEmpty}" language="${p.language}">${inner}</Gather>`;
 
 /** TwiML for the outbound call. If gatherUrl is set, listen for a spoken / keypad reply. */
 export function buildCallTwiml(message, p, gatherUrl) {
@@ -121,9 +129,22 @@ export function buildSayHangupTwiml(p, text) {
   return `${XML}<Response>${say(p, text)}<Hangup/></Response>`;
 }
 
-/** Answer an inbound call from the user and record what they say. */
-export function buildInboundTwiml(p, gatherUrl) {
-  return `${XML}<Response>${gather(p, gatherUrl, say(p, p.inboundGreeting), "speech")}${say(p, p.inboundEmpty)}</Response>`;
+/**
+ * Answer an inbound call from the user: first read any saved messages (each in its own language),
+ * then record what they say. With saved messages, an empty reply is still posted so the session learns
+ * they were heard.
+ */
+export function buildInboundTwiml(p, gatherUrl, saved = []) {
+  let x = `${XML}<Response>`;
+  if (saved.length) {
+    x += say(p, p.savedIntro(saved.length));
+    for (const m of saved) {
+      const mp = { ...LANGUAGES[m.language], language: m.language, voice: m.language === p.language ? p.voice : LANGUAGES[m.language].voice };
+      x += say(mp, `${mp.savedFrom(m.project)} ${m.message}`) + `<Pause length="1"/>`;
+    }
+  }
+  x += gather(p, gatherUrl, say(p, p.inboundGreeting), "speech", saved.length > 0);
+  return x + say(p, p.inboundEmpty) + `</Response>`;
 }
 
 export const REJECT_TWIML = `${XML}<Response><Reject/></Response>`;
@@ -152,3 +173,57 @@ export function validSignature(authToken, url, params, header) {
 }
 
 export const TERMINAL_STATUSES = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
+
+/**
+ * What happened on an outbound call, from Twilio's final status + answering-machine detection.
+ * On the user's carrier a rejected call goes straight to voicemail, which Twilio sees as answered by a machine;
+ * a call that just rings out ends as "no-answer" (our 30 s ring timeout is shorter than the voicemail delay).
+ * Returns: answered | short | rejected | no-answer | busy | failed | canceled
+ */
+export function classifyOutcome({ status, answeredBy, duration }) {
+  if (status !== "completed") return status;
+  if (answeredBy && /^(machine|fax)/.test(answeredBy)) return "rejected";
+  // Without AMD a sub-3-second call means they picked up and hung up before hearing anything.
+  if (!answeredBy && Number(duration) < 3) return "short";
+  return "answered";
+}
+
+export const RETRYABLE = new Set(["no-answer", "busy"]);
+
+// ---- shared state across sessions: saved messages + do-not-disturb after a rejected call
+
+const stateFile = (dir) => path.join(dir, "state.json");
+
+export function readState(dir = STATE_DIR) {
+  try {
+    const st = JSON.parse(fs.readFileSync(stateFile(dir), "utf8"));
+    return { saved: st.saved || [], dndUntil: st.dndUntil || 0 };
+  } catch {
+    return { saved: [], dndUntil: 0 };
+  }
+}
+
+export function writeState(st, dir = STATE_DIR) {
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = stateFile(dir) + "." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(st, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, stateFile(dir));
+}
+
+/** Save a message to be read when the user calls back; optionally start do-not-disturb. */
+export function saveForCallback(entry, { dndMinutes = 0, now = Date.now(), dir = STATE_DIR } = {}) {
+  const st = readState(dir);
+  st.saved.push({ ...entry, at: new Date(now).toISOString() });
+  if (dndMinutes > 0) st.dndUntil = Math.max(st.dndUntil, now + dndMinutes * 60000);
+  writeState(st, dir);
+  return st;
+}
+
+/** The user called in: hand over saved messages and end do-not-disturb. */
+export function takeSaved(dir = STATE_DIR) {
+  const { saved } = readState(dir);
+  writeState({ saved: [], dndUntil: 0 }, dir);
+  return saved;
+}
+
+export const dndActive = (now = Date.now(), dir = STATE_DIR) => readState(dir).dndUntil > now;

@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   parseEnv, loadConfig, buildCallTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
   normalizeLanguage, speechProfile, offlineUrl, samePhone,
+  classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
 } from "../plugins/call-me/server/lib.mjs";
 
 test("parseEnv handles comments, quotes, export", () => {
@@ -80,3 +81,34 @@ test("twilio signature matches Twilio's documented example", () => {
 });
 
 test("xmlEscape", () => assert.equal(xmlEscape(`"'<>&`), "&quot;&apos;&lt;&gt;&amp;"));
+
+test("classifyOutcome: voicemail = rejected, ring-out = no-answer, instant hang-up = short", () => {
+  assert.equal(classifyOutcome({ status: "completed", answeredBy: "machine_start", duration: "14" }), "rejected");
+  assert.equal(classifyOutcome({ status: "completed", answeredBy: "fax" }), "rejected");
+  assert.equal(classifyOutcome({ status: "completed", answeredBy: "human", duration: "1" }), "answered");
+  assert.equal(classifyOutcome({ status: "completed", answeredBy: "unknown", duration: "9" }), "answered");
+  assert.equal(classifyOutcome({ status: "completed", answeredBy: null, duration: "1" }), "short");
+  assert.equal(classifyOutcome({ status: "no-answer", duration: "0" }), "no-answer");
+  assert.equal(classifyOutcome({ status: "busy" }), "busy");
+});
+
+test("saved messages and do-not-disturb", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cm-st-"));
+  const now = Date.now();
+  assert.equal(dndActive(now, dir), false);
+  saveForCallback({ message: "a", language: "pl-PL", project: "p" }, { dir, now });
+  assert.equal(dndActive(now, dir), false);
+  saveForCallback({ message: "b", language: "en-US", project: "q" }, { dir, now, dndMinutes: 120 });
+  assert.equal(dndActive(now + 119 * 60000, dir), true);
+  assert.equal(dndActive(now + 121 * 60000, dir), false);
+  assert.deepEqual(takeSaved(dir).map((m) => m.message), ["a", "b"]);
+  assert.deepEqual(readState(dir), { saved: [], dndUntil: 0 });
+  assert.equal((fs.statSync(path.join(dir, "state.json")).mode & 0o777), 0o600);
+});
+
+test("inbound twiml reads saved messages before listening", () => {
+  const x = buildInboundTwiml(speechProfile({ CALL_ME_LANGUAGE: "pl-PL" }), "https://x/g", [
+    { message: "Gotowe.", language: "pl-PL", project: "euro" },
+  ]);
+  assert.match(x, /Masz jedną zapisaną wiadomość\.<\/Say><Say[^>]*>Z projektu euro: Gotowe\.<\/Say><Pause length="1"\/><Gather/);
+});

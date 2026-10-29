@@ -4,15 +4,19 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { twilioSignature } from "../plugins/call-me/server/lib.mjs";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const TOKEN = "tok";
 const ME = "+48500000001";
-const PORT = 20000 + Math.floor(Math.random() * 20000);
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT, BASE;
 
-function startServer() {
+function startServer(extraEnv = {}) {
+  PORT = 20000 + Math.floor(Math.random() * 20000);
+  BASE = `http://127.0.0.1:${PORT}`;
   const proc = spawn(process.execPath, ["--import", here("./fake-twilio.mjs"), here("../plugins/call-me/server/index.mjs")], {
     env: {
       ...process.env,
@@ -25,6 +29,8 @@ function startServer() {
       CALL_ME_INBOUND: "1",
       CALL_ME_PUBLIC_URL: BASE,
       CALL_ME_PORT: String(PORT),
+      CALL_ME_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cm-state-")),
+      ...extraEnv,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -83,7 +89,7 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
     const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
     assert.equal(ev.content, "Odpal testy");
-    assert.deepEqual(ev.meta, { from: ME, language: "pl-PL", confidence: "0.93", call_sid: "CAin" });
+    assert.deepEqual(ev.meta, { from: ME, language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0" });
 
     // Outbound call in English although the default is Polish.
     s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Tests passed.", language: "en-US" } } });
@@ -108,6 +114,55 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     const release = s.twilio.filter((r) => r.form.VoiceUrl).at(-1);
     assert.match(release.form.VoiceUrl, /twimlets\.com\/echo/);
     assert.equal(release.form.VoiceMethod, "GET");
+  } finally {
+    s.proc.kill();
+  }
+});
+
+test("retries unanswered calls, stops on rejection, holds calls until the user calls back", async () => {
+  const s = startServer({ FAKE_CALLS: "no-answer;in-progress:machine_start;completed:human:12", CALL_ME_RETRY_DELAY: "0.1" });
+  const result = async (id) => {
+    await s.until(() => s.stdout.some((m) => m.id === id), 15000);
+    return s.stdout.find((m) => m.id === id).result.content[0].text;
+  };
+  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+
+    // 1st attempt rings out, 2nd hits voicemail (= rejected): no 3rd attempt, voicemail hung up.
+    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Build failed.", wait_for_reply: false } } });
+    assert.match(await result(2), /REJECTED/);
+    assert.equal(created().length, 2);
+    assert.equal(created()[0].form.MachineDetection, "Enable");
+    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA2.json") && r.form.Status === "completed"));
+
+    // Do-not-disturb: the next call is only saved, unless forced.
+    s.send({ id: 3, method: "tools/call", params: { name: "call_me", arguments: { message: "Second thing.", language: "en-US" } } });
+    assert.match(await result(3), /Not called/);
+    assert.equal(created().length, 2);
+
+    // The user calls back: both saved messages are read, each in its language, then the session is notified.
+    const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
+    assert.match(answer.body, /Zapisane wiadomości: 2\./);
+    assert.match(answer.body, /language="pl-PL">Z projektu [^<]+: Build failed\./);
+    assert.match(answer.body, /voice="Polly\.Joanna" language="en-US">From [^<]+: Second thing\./);
+    assert.match(answer.body, /actionOnEmptyResult="true"/);
+    await webhook("/incoming/gather", { From: ME, CallSid: "CAin", SpeechResult: "Napraw build" });
+    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
+    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
+    assert.match(ev.content, /^Napraw build\n\nBefore speaking, the user heard/);
+    assert.match(ev.content, /Build failed\.[\s\S]*Second thing\./);
+    assert.equal(ev.meta.saved_messages_heard, "2");
+
+    // Calling back ended do-not-disturb: calls go through again.
+    s.send({ id: 4, method: "tools/call", params: { name: "call_me", arguments: { message: "Fixed.", wait_for_reply: false } } });
+    assert.match(await result(4), /message was delivered/);
+    assert.equal(created().length, 3);
+
+    // A second callback has nothing saved any more.
+    assert.doesNotMatch((await webhook("/incoming", { From: ME, CallSid: "CAin2" })).body, /Zapisane/);
   } finally {
     s.proc.kill();
   }
