@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // call-me MCP server: lets Claude phone you via Twilio and hear your spoken reply.
+// With CALL_ME_INBOUND=1 it also takes over the Twilio number so you can call Claude:
+// what you say is pushed into the session as a channel event (Claude Code "channels").
 // Zero dependencies — speaks MCP (JSON-RPC over stdio) directly.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -11,13 +13,19 @@ import readline from "node:readline";
 import {
   CONFIG_PATH,
   loadConfig,
+  speechProfile,
   buildCallTwiml,
-  buildAckTwiml,
+  buildSayHangupTwiml,
+  buildInboundTwiml,
+  offlineUrl,
+  samePhone,
+  REJECT_TWIML,
   validSignature,
   TERMINAL_STATUSES,
 } from "./lib.mjs";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
+const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -40,7 +48,7 @@ async function twilio(cfg, method, resource, form) {
 
 // ---------------------------------------------------- webhook server + tunnel
 
-const pending = new Map(); // callId -> { resolve }
+const pending = new Map(); // callId -> { resolve, profile }
 let webhook = null; // { port, publicUrl }
 
 function readBody(req) {
@@ -55,8 +63,9 @@ async function startServer(cfg) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://x");
     if (url.pathname === "/health") return res.end("ok");
-    const m = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
-    if (req.method !== "POST" || !m || !pending.has(m[1])) {
+    const outbound = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
+    const known = (outbound && pending.has(outbound[1])) || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
+    if (req.method !== "POST" || !known) {
       res.statusCode = 404;
       return res.end();
     }
@@ -67,13 +76,39 @@ async function startServer(cfg) {
       res.statusCode = 403;
       return res.end();
     }
-    pending.get(m[1]).resolve({
-      speech: params.SpeechResult || null,
-      confidence: params.Confidence ? Number(params.Confidence) : null,
-      digits: params.Digits || null,
-    });
     res.setHeader("Content-Type", "text/xml");
-    res.end(buildAckTwiml(cfg));
+
+    if (outbound) {
+      const { resolve, profile } = pending.get(outbound[1]);
+      resolve({
+        speech: params.SpeechResult || null,
+        confidence: params.Confidence ? Number(params.Confidence) : null,
+        digits: params.Digits || null,
+      });
+      return res.end(buildSayHangupTwiml(profile, profile.ack));
+    }
+
+    // Inbound: only the user's own phone may talk to the session.
+    const profile = speechProfile(cfg);
+    if (!samePhone(params.From, cfg.CALL_ME_TO_NUMBER)) {
+      log(`rejected inbound call from ${params.From}`);
+      return res.end(REJECT_TWIML);
+    }
+    if (url.pathname === "/incoming") return res.end(buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`));
+    if (params.SpeechResult) {
+      log(`inbound message from ${params.From}`);
+      notify("notifications/claude/channel", {
+        content: params.SpeechResult,
+        meta: {
+          from: params.From,
+          language: profile.language,
+          confidence: params.Confidence ? Number(params.Confidence).toFixed(2) : "unknown",
+          call_sid: params.CallSid,
+        },
+      });
+      return res.end(buildSayHangupTwiml(profile, profile.inboundAck));
+    }
+    res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
   });
   const port = Number(cfg.CALL_ME_PORT || 0);
   await new Promise((r) => server.listen(port, "127.0.0.1", r));
@@ -155,19 +190,60 @@ async function ensureWebhook(cfg) {
   return webhook;
 }
 
-for (const sig of ["exit", "SIGINT", "SIGTERM"])
-  process.on(sig, () => {
-    tunnelProc?.kill();
-    if (sig !== "exit") process.exit(0);
+// --------------------------------------------- inbound: own the Twilio number
+
+let ownedNumber = null; // { sid, voiceUrl } while this session answers calls
+
+async function claimNumber(cfg) {
+  const { publicUrl } = await ensureWebhook(cfg);
+  const list = await twilio(cfg, "GET", `IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(cfg.TWILIO_FROM_NUMBER)}`);
+  const num = list.incoming_phone_numbers?.[0];
+  if (!num) throw new Error(`${cfg.TWILIO_FROM_NUMBER} is not a number on this Twilio account`);
+  const voiceUrl = `${publicUrl}/incoming`;
+  const offline = offlineUrl(speechProfile(cfg));
+  // The fallback URL covers a session that dies without releasing the number.
+  await twilio(cfg, "POST", `IncomingPhoneNumbers/${num.sid}.json`, {
+    VoiceUrl: voiceUrl,
+    VoiceMethod: "POST",
+    VoiceFallbackUrl: offline,
+    VoiceFallbackMethod: "GET",
   });
+  ownedNumber = { sid: num.sid, voiceUrl };
+  log(`answering calls to ${cfg.TWILIO_FROM_NUMBER}`);
+}
+
+/** Point the number back at the offline message — unless a newer session has taken it over. */
+async function releaseNumber() {
+  if (!ownedNumber) return;
+  const { cfg } = loadConfig();
+  const { sid, voiceUrl } = ownedNumber;
+  ownedNumber = null;
+  const num = await twilio(cfg, "GET", `IncomingPhoneNumbers/${sid}.json`);
+  if (num.voice_url !== voiceUrl) return;
+  await twilio(cfg, "POST", `IncomingPhoneNumbers/${sid}.json`, { VoiceUrl: offlineUrl(speechProfile(cfg)), VoiceMethod: "GET" });
+  log("released number");
+}
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.race([releaseNumber().catch((e) => log(`release failed: ${e.message}`)), sleep(5000)]);
+  tunnelProc?.kill();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("exit", () => tunnelProc?.kill());
 
 // ------------------------------------------------------------------ the tool
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180 }) {
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language }) {
   const { cfg, missing } = loadConfig();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
+  const profile = speechProfile(cfg, language);
 
   const callId = crypto.randomBytes(16).toString("hex");
   let gatherUrl = null;
@@ -175,13 +251,13 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180 })
   if (wait_for_reply) {
     const { publicUrl } = await ensureWebhook(cfg);
     gatherUrl = `${publicUrl}/gather/${callId}`;
-    replyPromise = new Promise((resolve) => pending.set(callId, { resolve }));
+    replyPromise = new Promise((resolve) => pending.set(callId, { resolve, profile }));
   }
 
   const call = await twilio(cfg, "POST", "Calls.json", {
     To: cfg.CALL_ME_TO_NUMBER,
     From: cfg.TWILIO_FROM_NUMBER,
-    Twiml: buildCallTwiml(message, cfg, gatherUrl),
+    Twiml: buildCallTwiml(message, profile, gatherUrl),
     Timeout: "30",
   });
   log(`placed call ${call.sid}`);
@@ -228,13 +304,19 @@ const TOOLS = [
       "Phone the user and speak a message aloud (text-to-speech), then optionally listen for their spoken or keypad reply and return it. " +
       "Use when the user asked to be called, when a long-running task finishes or fails and they asked to be notified, " +
       "or when you are blocked on a decision and the user said they may be away from the screen. " +
-      "Keep the message short and speakable (no code, URLs, or markdown). If you need a decision, phrase it as a question with simple options.",
+      "Keep the message short and speakable (no code, URLs, or markdown). If you need a decision, phrase it as a question with simple options. " +
+      "Write the message in the call's language.",
     inputSchema: {
       type: "object",
       properties: {
         message: { type: "string", description: "What to say on the call. Plain spoken sentences, ideally under ~60 words." },
         wait_for_reply: { type: "boolean", description: "Listen for and return the user's reply (default true). Set false for a one-way notification.", default: true },
         timeout_seconds: { type: "number", description: "Max seconds to wait for the call to finish (default 180).", default: 180 },
+        language: {
+          type: "string",
+          enum: ["en-US", "pl-PL"],
+          description: "Language of the call: voice, fixed phrases and speech recognition. Omit to use the user's configured default.",
+        },
       },
       required: ["message"],
     },
@@ -244,18 +326,32 @@ const TOOLS = [
 // ------------------------------------------------------------- MCP over stdio
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+
+const CHANNEL_INSTRUCTIONS =
+  'Events in <channel source="call-me"> tags are the user talking to you over the phone (speech-to-text, so expect ' +
+  "transcription errors). Treat them as a request typed by the user. The user is away from the screen: when you finish, " +
+  "or if you need a decision, phone them back with the call_me tool, in the language they spoke (meta language).";
 
 async function handle(msg) {
   const { id, method, params } = msg;
-  if (id === undefined) return; // notification
+  if (id === undefined) {
+    if (method === "notifications/initialized" && INBOUND) {
+      const { cfg, missing } = loadConfig();
+      if (missing.length) log("CALL_ME_INBOUND set but call-me is not configured");
+      else claimNumber(cfg).catch((e) => log(`could not take over the number: ${e.message}`));
+    }
+    return;
+  }
   try {
     let result;
     switch (method) {
       case "initialize":
         result = {
           protocolVersion: params?.protocolVersion || "2025-06-18",
-          capabilities: { tools: {} },
+          capabilities: { tools: {}, ...(INBOUND ? { experimental: { "claude/channel": {} } } : {}) },
           serverInfo: { name: "call-me", version: VERSION },
+          ...(INBOUND ? { instructions: CHANNEL_INSTRUCTIONS } : {}),
         };
         break;
       case "ping":
@@ -292,7 +388,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   handle(msg);
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", shutdown);
 
 const { missing } = loadConfig();
 log(missing.length ? `not configured yet (missing ${missing.join(", ")}; see ${CONFIG_PATH})` : "ready");
