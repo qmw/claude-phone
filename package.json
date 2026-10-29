@@ -1,0 +1,6 @@
+{
+  "name": "claude-call-me",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/" }
+}

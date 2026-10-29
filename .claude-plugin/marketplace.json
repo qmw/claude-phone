@@ -1,0 +1,12 @@
+{
+  "name": "claude-call-me",
+  "owner": { "name": "qmw" },
+  "description": "Claude Code plugin that lets Claude phone you and hear your reply.",
+  "plugins": [
+    {
+      "name": "call-me",
+      "source": "./plugins/call-me",
+      "description": "Lets Claude phone you (Twilio) with a spoken message and hear your reply."
+    }
+  ]
+}
