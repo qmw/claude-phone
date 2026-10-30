@@ -87,12 +87,12 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
     assert.match(answer.body, /<Gather input="speech" action="http:\/\/127\.0\.0\.1:\d+\/incoming\/gather"[^>]*language="pl-PL"/);
     const done = await webhook("/incoming/gather", { From: ME, CallSid: "CAin", SpeechResult: "Odpal testy", Confidence: "0.93" });
-    assert.match(done.body, /Przyjąłem, przekazuję/);
+    assert.match(done.body, /<Redirect method="POST">http:\/\/127\.0\.0\.1:\d+\/live\/wait<\/Redirect>/);
     await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
     const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
     assert.equal(ev.content, "Odpal testy");
     assert.deepEqual(ev.meta, {
-      from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0",
+      live: "true", from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0",
     });
 
     // A second phone on the allow-list gets through too.
@@ -170,6 +170,63 @@ test("retries unanswered calls, stops on rejection, holds calls until the user c
 
     // A second callback has nothing saved any more.
     assert.doesNotMatch((await webhook("/incoming", { From: ME, CallSid: "CAin2" })).body, /Zapisane/);
+  } finally {
+    s.proc.kill();
+  }
+});
+
+test("live conversation: inbound and outbound calls stay open for phone_reply", async () => {
+  const s = startServer({ CALL_ME_LIVE_HOLD: "60" });
+  const result = async (id) => {
+    await s.until(() => s.stdout.some((m) => m.id === id), 10000);
+    return s.stdout.find((m) => m.id === id).result.content[0].text;
+  };
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    await s.until(() => s.stdout.some((m) => m.id === 1));
+    s.send({ id: 9, method: "tools/list" });
+    await s.until(() => s.stdout.some((m) => m.id === 9));
+    assert.deepEqual(s.stdout.find((m) => m.id === 9).result.tools.map((t) => t.name), ["call_me", "phone_reply"]);
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+
+    // Inbound: the user speaks and is put on hold.
+    await webhook("/incoming", { From: ME, CallSid: "CAlive" });
+    const hold = await webhook("/incoming/gather", { From: ME, CallSid: "CAlive", SpeechResult: "Jaka pogoda?" });
+    assert.match(hold.body, /<Pause length="2"\/><Redirect/);
+    assert.doesNotMatch(hold.body, /<Say/);
+    // Nothing to say yet: keep holding.
+    assert.match((await webhook("/live/wait", { CallSid: "CAlive" })).body, /<Redirect/);
+
+    // Claude answers; Twilio's next poll speaks it and listens.
+    s.send({ id: 2, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "Słonecznie. Coś jeszcze?" } } });
+    let turn;
+    for (let i = 0; i < 20 && !/Gather/.test((turn = (await webhook("/live/wait", { CallSid: "CAlive" })).body)); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(turn, /<Gather input="speech dtmf" action="http:\/\/127\.0\.0\.1:\d+\/live\/gather"[^>]*><Say[^>]*>Słonecznie\. Coś jeszcze\?<\/Say><\/Gather>/);
+    assert.match((await webhook("/live/gather", { CallSid: "CAlive", SpeechResult: "Nie, dzięki" })).body, /<Redirect/);
+    assert.match(await result(2), /User said: "Nie, dzięki"/);
+
+    // Claude ends the call.
+    s.send({ id: 3, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "Pa!", end_call: true } } });
+    let bye;
+    for (let i = 0; i < 20 && !/Hangup/.test((bye = (await webhook("/live/wait", { CallSid: "CAlive" })).body)); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(bye, /Pa!<\/Say><Hangup\/>/);
+    assert.match(await result(3), /Said it and hung up/);
+    s.send({ id: 4, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "x" } } });
+    assert.match(await result(4), /No live call/);
+
+    // Outbound with stay_on_line: after the reply the call is held instead of hung up.
+    s.send({ id: 5, method: "tools/call", params: { name: "call_me", arguments: { message: "Testy padły.", stay_on_line: true } } });
+    await s.until(() => s.twilio.some((r) => r.form.Twiml));
+    const action = s.twilio.find((r) => r.form.Twiml).form.Twiml.match(/action="([^"]+)"/)[1];
+    assert.match((await webhook(new URL(action).pathname, { CallSid: "CA1", SpeechResult: "Które?" })).body, /<Redirect/);
+    assert.match(await result(5), /User replied by voice: "Które\?".*still on the line.*phone_reply \(call_sid "CA1"\)/);
+
+    // Silence after Claude's line ends the call.
+    s.send({ id: 6, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CA1", message: "Dwa testy e2e." } } });
+    for (let i = 0; i < 20 && !/Gather/.test((await webhook("/live/wait", { CallSid: "CA1" })).body); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match((await webhook("/live/gather", { CallSid: "CA1" })).body, /Nie otrzymałem odpowiedzi.*<Hangup\/>/);
+    assert.match(await result(6), /said nothing/);
   } finally {
     s.proc.kill();
   }

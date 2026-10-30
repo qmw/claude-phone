@@ -17,6 +17,8 @@ import {
   buildCallTwiml,
   buildSayHangupTwiml,
   buildInboundTwiml,
+  buildHoldTwiml,
+  buildLiveTurnTwiml,
   offlineUrl,
   allowedCaller,
   machineName,
@@ -30,8 +32,9 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
+const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -58,6 +61,66 @@ const pending = new Map(); // callId -> { resolve, profile }
 const heardSaved = new Map(); // inbound CallSid -> saved messages read to the user on that call
 let webhook = null; // { port, publicUrl }
 
+// Live calls: the user stays on the line while Claude works out its next line (phone_reply).
+// CallSid -> { profile, lines: [{message, end}], heard: [], wake, turnStart, saidHold, lastNudge, lastSeen, ended }
+const live = new Map();
+
+function startLive(sid, profile) {
+  const now = Date.now();
+  live.set(sid, { profile, lines: [], heard: [], wake: null, turnStart: now, saidHold: false, lastNudge: now, lastSeen: now, ended: null });
+}
+
+function endLive(e, reason) {
+  e.ended = e.ended || reason;
+  e.wake?.();
+}
+
+/** Twilio polls this while the user is on hold. */
+function liveWait(cfg, e) {
+  const p = e.profile;
+  const { publicUrl } = webhook;
+  e.lastSeen = Date.now();
+  const line = e.lines.shift();
+  if (line) {
+    e.wake?.();
+    if (line.end) {
+      endLive(e, "ended by Claude");
+      return buildSayHangupTwiml(p, line.message);
+    }
+    return buildLiveTurnTwiml(p, line.message, `${publicUrl}/live/gather`);
+  }
+  const waited = Date.now() - e.turnStart;
+  if (waited > Number(cfg.CALL_ME_LIVE_HOLD || 120) * 1000) {
+    endLive(e, "hold-timeout");
+    return buildSayHangupTwiml(p, p.holdTimeout);
+  }
+  let text = null;
+  if (!e.saidHold && waited > 4000) {
+    e.saidHold = true;
+    e.lastNudge = Date.now();
+    text = p.hold;
+  } else if (e.saidHold && Date.now() - e.lastNudge > 25000) {
+    e.lastNudge = Date.now();
+    text = p.stillWorking;
+  }
+  return buildHoldTwiml(p, `${publicUrl}/live/wait`, text);
+}
+
+/** The user spoke (or stayed silent) after Claude's line. */
+function liveHeard(e, params) {
+  e.lastSeen = Date.now();
+  const said = params.SpeechResult || (params.Digits ? `(pressed keys ${params.Digits})` : null);
+  if (!said) {
+    endLive(e, "no-reply");
+    return buildSayHangupTwiml(e.profile, e.profile.noReply);
+  }
+  e.heard.push(said);
+  e.turnStart = Date.now();
+  e.saidHold = false;
+  e.wake?.();
+  return buildHoldTwiml(e.profile, `${webhook.publicUrl}/live/wait`, null);
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let d = "";
@@ -71,7 +134,8 @@ async function startServer(cfg) {
     const url = new URL(req.url, "http://x");
     if (url.pathname === "/health") return res.end("ok");
     const outbound = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
-    const known = (outbound && pending.has(outbound[1])) || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
+    const liveRoute = url.pathname.match(/^\/live\/(wait|gather)$/);
+    const known = (outbound && pending.has(outbound[1])) || liveRoute || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
     if (req.method !== "POST" || !known) {
       res.statusCode = 404;
       return res.end();
@@ -85,13 +149,23 @@ async function startServer(cfg) {
     }
     res.setHeader("Content-Type", "text/xml");
 
+    if (liveRoute) {
+      const e = live.get(params.CallSid);
+      if (!e || e.ended) return res.end(buildSayHangupTwiml(speechProfile(cfg), speechProfile(cfg).bye));
+      return res.end(liveRoute[1] === "wait" ? liveWait(cfg, e) : liveHeard(e, params));
+    }
+
     if (outbound) {
-      const { resolve, profile } = pending.get(outbound[1]);
+      const { resolve, profile, stayOnLine } = pending.get(outbound[1]);
       resolve({
         speech: params.SpeechResult || null,
         confidence: params.Confidence ? Number(params.Confidence) : null,
         digits: params.Digits || null,
       });
+      if (stayOnLine && (params.SpeechResult || params.Digits)) {
+        startLive(params.CallSid, profile);
+        return res.end(buildHoldTwiml(profile, `${webhook.publicUrl}/live/wait`, null));
+      }
       return res.end(buildSayHangupTwiml(profile, profile.ack));
     }
 
@@ -117,9 +191,12 @@ async function startServer(cfg) {
           "\n\nBefore speaking, the user heard these saved messages from earlier unanswered calls " +
           "(route any answer to the session working in that project):\n" +
           saved.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n");
+      const liveCall = !NO.test(cfg.CALL_ME_LIVE || "") && !!params.SpeechResult;
+      if (liveCall) startLive(params.CallSid, profile);
       notify("notifications/claude/channel", {
         content,
         meta: {
+          live: String(liveCall),
           from: params.From,
           to: params.To || cfg.TWILIO_FROM_NUMBER,
           machine: machineName(cfg),
@@ -129,6 +206,7 @@ async function startServer(cfg) {
           saved_messages_heard: String(saved.length),
         },
       });
+      if (liveCall) return res.end(buildHoldTwiml(profile, `${webhook.publicUrl}/live/wait`, null));
       return res.end(buildSayHangupTwiml(profile, params.SpeechResult ? profile.inboundAck : profile.inboundEmpty));
     }
     res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
@@ -276,14 +354,14 @@ const RESULT = {
 };
 
 /** One outbound call attempt. Returns { outcome, reply, sid }. */
-async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds) {
+async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds, stayOnLine = false) {
   const callId = crypto.randomBytes(16).toString("hex");
   let gatherUrl = null;
   let replyPromise = new Promise(() => {});
   if (wait_for_reply) {
     const { publicUrl } = await ensureWebhook(cfg);
     gatherUrl = `${publicUrl}/gather/${callId}`;
-    replyPromise = new Promise((resolve) => pending.set(callId, { resolve, profile }));
+    replyPromise = new Promise((resolve) => pending.set(callId, { resolve, profile, stayOnLine }));
   }
 
   const amd = cfg.CALL_ME_AMD !== "0";
@@ -325,7 +403,7 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds)
   return { outcome, sid: call.sid };
 }
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false }) {
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false }) {
   const { cfg, missing } = loadConfig();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
@@ -343,7 +421,7 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
   const delay = Number(cfg.CALL_ME_RETRY_DELAY ?? 90) * 1000;
   let r;
   for (let attempt = 0; ; attempt++) {
-    r = await placeCall(cfg, profile, message, wait_for_reply, timeout_seconds);
+    r = await placeCall(cfg, profile, message, wait_for_reply || stay_on_line, timeout_seconds, stay_on_line);
     log(`attempt ${attempt + 1}: ${r.outcome}`);
     if (!RETRYABLE.has(r.outcome) || attempt >= maxRetries) break;
     await sleep(delay);
@@ -352,11 +430,15 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
 
   const tag = ` (call ${r.sid})`;
   switch (r.outcome) {
-    case "answered":
+    case "answered": {
+      const onLine = live.has(r.sid)
+        ? ` The user is still on the line: answer with phone_reply (call_sid "${r.sid}") right away; end with end_call: true.`
+        : "";
       if (r.reply?.speech)
-        return `User replied by voice: "${r.reply.speech}"` + (r.reply.confidence != null ? ` (confidence ${r.reply.confidence.toFixed(2)})` : "") + tag;
-      if (r.reply?.digits) return `User pressed keys: ${r.reply.digits}${tag}`;
+        return `User replied by voice: "${r.reply.speech}"` + (r.reply.confidence != null ? ` (confidence ${r.reply.confidence.toFixed(2)})` : "") + tag + onLine;
+      if (r.reply?.digits) return `User pressed keys: ${r.reply.digits}${tag}${onLine}`;
       return (wait_for_reply ? "Call was answered but the user gave no reply." : "Call answered; message was delivered.") + tag;
+    }
     case "rejected":
       saveForCallback(entry, { dndMinutes });
       return RESULT.rejected + tag;
@@ -369,6 +451,48 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
     default:
       return (RESULT[r.outcome] || `Call ended with status ${r.outcome}.`) + tag;
   }
+}
+
+/** Say the next line on a live call and return what the user says back. */
+async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120 }) {
+  const { cfg } = loadConfig();
+  const e = live.get(call_sid);
+  if (!e) throw new Error(`No live call ${call_sid}. Use call_me to call the user.`);
+  if (e.ended) {
+    live.delete(call_sid);
+    return `The call has already ended (${e.ended}); nothing was said. Use call_me if the user still needs to hear it.`;
+  }
+  if (!message || !String(message).trim()) throw new Error("message is required");
+  e.heard.length = 0; // anything said before this line has already been answered or is stale
+  e.lines.push({ message, end: end_call });
+  const deadline = Date.now() + (end_call ? 15 : timeout_seconds) * 1000;
+  let lastCheck = Date.now();
+  while (Date.now() < deadline) {
+    if (end_call ? !e.lines.length : e.heard.length || e.ended) break;
+    await new Promise((r) => {
+      e.wake = r;
+      setTimeout(r, 1000);
+    });
+    e.wake = null;
+    // Twilio polls at least every few seconds while the call is up; long silence means the user may have hung up.
+    if (Date.now() - e.lastSeen > 20000 && Date.now() - lastCheck > 5000) {
+      lastCheck = Date.now();
+      const c = await twilio(cfg, "GET", `Calls/${call_sid}.json`).catch(() => null);
+      if (c && TERMINAL_STATUSES.has(c.status)) endLive(e, "the user hung up");
+    }
+  }
+  if (end_call) {
+    live.delete(call_sid);
+    return e.lines.length ? "The call ended before the line could be said." : "Said it and hung up.";
+  }
+  if (e.heard.length) return `User said: "${e.heard.splice(0).join(" ")}" (still on the line; answer with phone_reply)`;
+  if (e.ended) {
+    live.delete(call_sid);
+    return e.ended === "no-reply"
+      ? "The user said nothing after your line; the call was ended."
+      : `The call has ended (${e.ended}).` + (e.lines.length ? " Your line was not said." : "");
+  }
+  return `No reply within ${timeout_seconds}s; the user is still on hold. Call phone_reply again or end the call with end_call: true.`;
 }
 
 const TOOLS = [
@@ -391,6 +515,10 @@ const TOOLS = [
         timeout_seconds: { type: "number", description: "Max seconds to wait for the call to finish (default 180).", default: 180 },
         retries: { type: "number", description: "Extra attempts if the user doesn't pick up (default 4, 90 s apart). Use 0 for anything not worth repeating." },
         force: { type: "boolean", description: "Call even though the user rejected an earlier call. Only when the user explicitly asked to be called now." },
+        stay_on_line: {
+          type: "boolean",
+          description: "Keep the call open after the user's reply for a live conversation: answer with phone_reply. Use when the user may want to talk it through.",
+        },
         language: {
           type: "string",
           enum: ["en-US", "pl-PL"],
@@ -398,6 +526,24 @@ const TOOLS = [
         },
       },
       required: ["message"],
+    },
+  },
+  {
+    name: "phone_reply",
+    description:
+      "Live phone conversation: say your next line to a user who is still on the line (call_sid from a live channel event or from call_me with stay_on_line) " +
+      "and return what they say back. The user hears 'one moment' while you work, and the call ends after about 2 minutes on hold, " +
+      "so reply quickly. Keep lines short and speakable, in the call's language. Finish with end_call: true. " +
+      "If a task will take longer than a minute, say so, end the call, and call_me them when done.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        call_sid: { type: "string", description: "The live call's CallSid." },
+        message: { type: "string", description: "What to say. Plain spoken sentences." },
+        end_call: { type: "boolean", description: "Say the message, then hang up (default false).", default: false },
+        timeout_seconds: { type: "number", description: "Max seconds to wait for the user's answer (default 120).", default: 120 },
+      },
+      required: ["call_sid", "message"],
     },
   },
 ];
@@ -410,7 +556,10 @@ const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
 const CHANNEL_INSTRUCTIONS =
   'Events in <channel source="call-me"> tags are the user talking to you over the phone (speech-to-text, so expect ' +
   "transcription errors). Treat them as a request typed by the user. The user is away from the screen: when you finish, " +
-  "or if you need a decision, phone them back with the call_me tool, in the language they spoke (meta language).";
+  "or if you need a decision, phone them back with the call_me tool, in the language they spoke (meta language). " +
+  'When meta live="true" the user is still on the line, on hold: answer right away with phone_reply(call_sid, ...), ' +
+  "which returns their next sentence, and keep the conversation going; end it with end_call: true. For work that takes more " +
+  "than about a minute (such as handing a task to another session), say you will call back, end the call, then use call_me.";
 
 async function handle(msg) {
   const { id, method, params } = msg;
@@ -440,11 +589,12 @@ async function handle(msg) {
         result = { tools: TOOLS };
         break;
       case "tools/call": {
-        if (params?.name !== "call_me") throw Object.assign(new Error(`Unknown tool ${params?.name}`), { code: -32602 });
+        const tool = { call_me: callMe, phone_reply: phoneReply }[params?.name];
+        if (!tool) throw Object.assign(new Error(`Unknown tool ${params?.name}`), { code: -32602 });
         try {
-          result = { content: [{ type: "text", text: await callMe(params.arguments || {}) }] };
+          result = { content: [{ type: "text", text: await tool(params.arguments || {}) }] };
         } catch (e) {
-          result = { content: [{ type: "text", text: `call_me failed: ${e.message}` }], isError: true };
+          result = { content: [{ type: "text", text: `${params.name} failed: ${e.message}` }], isError: true };
         }
         break;
       }

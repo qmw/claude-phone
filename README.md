@@ -37,7 +37,7 @@ Update later with `claude plugin marketplace update claude-call-me`.
 
 Just ask: *"run the full test suite and call me with the result"* or *"if you need a decision, call me."*
 
-The tool is `call_me(message, wait_for_reply=true, timeout_seconds=180, language)`. `language` is `en-US` or `pl-PL` and sets the voice, the fixed phrases and speech recognition for that one call. Leave it out to use `CALL_ME_LANGUAGE`. A session can tell Claude "call me in English" and it will pass `language: "en-US"`.
+The tool is `call_me(message, wait_for_reply=true, timeout_seconds=180, language, stay_on_line)`. A second tool, `phone_reply`, continues a [live conversation](#live-conversation). `language` is `en-US` or `pl-PL` and sets the voice, the fixed phrases and speech recognition for that one call. Leave it out to use `CALL_ME_LANGUAGE`. A session can tell Claude "call me in English" and it will pass `language: "en-US"`.
 
 It returns one of:
 
@@ -85,6 +85,17 @@ Requirements: a claude.ai login and an interactive session (not `-p`). Ordinary 
 
 Each channel event carries `from` (your phone), `to` (the Twilio number you dialled) and `machine` (`CALL_ME_MACHINE`, or the hostname by default).
 
+## Live conversation
+
+A call can stay open, so you and Claude talk back and forth in real time:
+
+- **When you call in**, you stay on the line after you speak. Claude answers with `phone_reply`, which speaks its line, listens and returns your next sentence. This repeats until Claude ends the call with `end_call: true`. Set `CALL_ME_LIVE=0` to go back to "got it, passing it on" and hang up.
+- **When Claude calls you**, it passes `stay_on_line: true` to `call_me` when you may want to talk it through. After your reply, the call goes on the same way. This works in any session; channels aren't needed.
+
+While Claude thinks, you hear silence. After 4 seconds you hear "one moment", and every 25 seconds "still working on it". Each turn takes a few seconds, because Claude reads your words as text and the answer is spoken by text-to-speech. If Claude doesn't answer within `CALL_ME_LIVE_HOLD` seconds (default 120), it says it will call back and hangs up. For longer jobs, such as handing a task to another session, Claude says it will call back, ends the call, and later uses `call_me`.
+
+You can talk over Claude's line to interrupt it. If you stay silent twice after a line, the call ends.
+
 ## Several machines
 
 Give each machine **its own Twilio number**. You then dial the machine you want, and its calls to you show its number. Every number can live on the same Twilio account, but a trial account allows only one number.
@@ -122,6 +133,8 @@ Don't run `claude-phone` on two machines with the **same** Twilio number: the se
 | `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |
 | `CALL_ME_AMD` | | `0` turns off answering machine detection, which costs about $0.0075 per call. Rejections then can't be detected. |
 | `CALL_ME_STATE_DIR` | | Where saved messages are kept (default `~/.local/state/claude-call-me`) |
+| `CALL_ME_LIVE` | | `0` = inbound calls hang up after you speak instead of staying open (default on) |
+| `CALL_ME_LIVE_HOLD` | | Seconds you are kept on hold waiting for Claude's next line (default 120) |
 | `CALL_ME_INBOUND` | | `1` = take over the number and answer calls (set by the `claude-phone` launcher) |
 | `CALL_ME_PUBLIC_URL` | | Use your own public URL instead of cloudflared |
 | `CALL_ME_PORT` | | Local webhook port (default: random) |

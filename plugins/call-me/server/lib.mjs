@@ -58,6 +58,10 @@ export const LANGUAGES = {
     inboundAck: "Got it, passing it on. Goodbye.",
     inboundEmpty: "I didn't hear anything. Goodbye.",
     offline: "Claude is offline right now. Goodbye.",
+    hold: "One moment.",
+    stillWorking: "Still working on it.",
+    holdTimeout: "This will take longer. I'll call you back when I'm done. Goodbye.",
+    bye: "Goodbye.",
     savedIntro: (n) => (n === 1 ? "You have one saved message." : `You have ${n} saved messages.`),
     savedFrom: (project) => `From ${project}:`,
   },
@@ -72,6 +76,10 @@ export const LANGUAGES = {
     inboundAck: "Przyjąłem, przekazuję. Do usłyszenia.",
     inboundEmpty: "Nic nie usłyszałem. Do usłyszenia.",
     offline: "Claude jest teraz offline. Do usłyszenia.",
+    hold: "Chwileczkę.",
+    stillWorking: "Jeszcze chwila.",
+    holdTimeout: "To potrwa dłużej. Zadzwonię, jak skończę. Do usłyszenia.",
+    bye: "Do usłyszenia.",
     savedIntro: (n) => (n === 1 ? "Masz jedną zapisaną wiadomość." : `Zapisane wiadomości: ${n}.`),
     savedFrom: (project) => `Z projektu ${project}:`,
   },
@@ -146,6 +154,16 @@ export function buildInboundTwiml(p, gatherUrl, saved = []) {
   }
   x += gather(p, gatherUrl, say(p, p.inboundGreeting), "speech", saved.length > 0);
   return x + say(p, p.inboundEmpty) + `</Response>`;
+}
+
+/** Live call: keep the user on hold (optionally saying something) and poll waitUrl for Claude's next line. */
+export function buildHoldTwiml(p, waitUrl, text) {
+  return `${XML}<Response>${text ? say(p, text) : ""}<Pause length="2"/><Redirect method="POST">${xmlEscape(waitUrl)}</Redirect></Response>`;
+}
+
+/** Live call: say Claude's line (the user may talk over it) and listen; silence twice posts an empty result. */
+export function buildLiveTurnTwiml(p, message, gatherUrl) {
+  return `${XML}<Response>${gather(p, gatherUrl, say(p, message))}${gather(p, gatherUrl, say(p, p.retry), "speech dtmf", true)}</Response>`;
 }
 
 export const REJECT_TWIML = `${XML}<Response><Reject/></Response>`;
