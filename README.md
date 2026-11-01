@@ -94,7 +94,7 @@ A call can stay open, so you and Claude talk back and forth in real time:
 
 While Claude thinks, you hear silence. After 4 seconds you hear "one moment", and every 25 seconds "still working on it". Each turn takes a few seconds, because Claude reads your words as text and the answer is spoken by text-to-speech. If Claude doesn't answer within `CALL_ME_LIVE_HOLD` seconds (default 120), it says it will call back and hangs up. For longer jobs, such as handing a task to another session, Claude says it will call back, ends the call, and later uses `call_me`.
 
-You can talk over Claude's line to interrupt it. If you stay silent twice after a line, the call ends.
+Claude always finishes its line, and it starts listening when the line ends, so anything you say during the line isn't heard. Set `CALL_ME_BARGE_IN=1` to be able to interrupt by talking, but then any sound on your side, including background noise, can cut the line off. If you stay silent twice after a line, the call ends.
 
 ## Several machines
 
@@ -128,6 +128,7 @@ Don't run `claude-phone` on two machines with the **same** Twilio number: the se
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
 | `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
 | `CALL_ME_SPEECH_TIMEOUT` | | Seconds of silence that end your turn when speaking (default 3) |
+| `CALL_ME_BARGE_IN` | | `1` lets you interrupt Claude's line in live calls by talking, but noise can also cut it off (default off) |
 | `CALL_ME_RETRIES` | | Extra attempts when you don't pick up (default 4) |
 | `CALL_ME_RETRY_DELAY` | | Seconds between attempts (default 90) |
 | `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |

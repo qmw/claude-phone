@@ -104,7 +104,7 @@ export function speechProfile(cfg, requested) {
   const def = normalizeLanguage(cfg.CALL_ME_LANGUAGE) || "en-US";
   const language = normalizeLanguage(requested) || def;
   // Seconds of silence that end the user's turn. Twilio's "auto" cut people off at their first pause.
-  const p = { ...LANGUAGES[language], language, speechTimeout: xmlEscape(cfg.CALL_ME_SPEECH_TIMEOUT || "3") };
+  const p = { ...LANGUAGES[language], language, speechTimeout: xmlEscape(cfg.CALL_ME_SPEECH_TIMEOUT || "3"), bargeIn: cfg.CALL_ME_BARGE_IN === "1" };
   if (language === def) {
     if (cfg.CALL_ME_VOICE) p.voice = cfg.CALL_ME_VOICE;
     if (cfg.CALL_ME_INTRO !== undefined) p.intro = cfg.CALL_ME_INTRO;
@@ -161,9 +161,14 @@ export function buildHoldTwiml(p, waitUrl, text) {
   return `${XML}<Response>${text ? say(p, text) : ""}<Pause length="2"/><Redirect method="POST">${xmlEscape(waitUrl)}</Redirect></Response>`;
 }
 
-/** Live call: say Claude's line (the user may talk over it) and listen; silence twice posts an empty result. */
+/**
+ * Live call: say Claude's line and listen; silence twice posts an empty result.
+ * Twilio stops a <Say> inside <Gather> at any sound, including noise, so the line stays outside it
+ * and always plays in full unless CALL_ME_BARGE_IN=1.
+ */
 export function buildLiveTurnTwiml(p, message, gatherUrl) {
-  return `${XML}<Response>${gather(p, gatherUrl, say(p, message))}${gather(p, gatherUrl, say(p, p.retry), "speech dtmf", true)}</Response>`;
+  const line = p.bargeIn ? gather(p, gatherUrl, say(p, message)) : say(p, message) + gather(p, gatherUrl, "");
+  return `${XML}<Response>${line}${gather(p, gatherUrl, say(p, p.retry), "speech dtmf", true)}</Response>`;
 }
 
 export const REJECT_TWIML = `${XML}<Response><Reject/></Response>`;

@@ -202,7 +202,8 @@ test("live conversation: inbound and outbound calls stay open for phone_reply", 
     s.send({ id: 2, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "Słonecznie. Coś jeszcze?" } } });
     let turn;
     for (let i = 0; i < 20 && !/Gather/.test((turn = (await webhook("/live/wait", { CallSid: "CAlive" })).body)); i++) await new Promise((r) => setTimeout(r, 50));
-    assert.match(turn, /<Gather input="speech dtmf" action="http:\/\/127\.0\.0\.1:\d+\/live\/gather"[^>]*><Say[^>]*>Słonecznie\. Coś jeszcze\?<\/Say><\/Gather>/);
+    assert.match(turn, /<Gather input="speech dtmf" action="http:\/\/127\.0\.0\.1:\d+\/live\/gather"[^>]*><\/Gather>/);
+    assert.match(turn, /<Say[^>]*>Słonecznie\. Coś jeszcze\?<\/Say><Gather/);
     assert.match((await webhook("/live/gather", { CallSid: "CAlive", SpeechResult: "Nie, dzięki" })).body, /<Redirect/);
     assert.match(await result(2), /User said: "Nie, dzięki"/);
 

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  parseEnv, loadConfig, buildCallTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
+  parseEnv, loadConfig, buildCallTwiml, buildLiveTurnTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
   normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName,
   classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
 } from "../plugins/call-me/server/lib.mjs";
@@ -127,4 +127,11 @@ test("inbound twiml reads saved messages before listening", () => {
     { message: "Gotowe.", language: "pl-PL", project: "euro" },
   ]);
   assert.match(x, /Masz jedną zapisaną wiadomość\.<\/Say><Say[^>]*>Z projektu euro: Gotowe\.<\/Say><Pause length="1"\/><Gather/);
+});
+
+test("live line plays in full unless barge-in is enabled", () => {
+  const full = buildLiveTurnTwiml(speechProfile({}), "One. Two.", "https://x/g");
+  assert.match(full, /<Response><Say[^>]*>One\. Two\.<\/Say><Gather /);
+  const interruptible = buildLiveTurnTwiml(speechProfile({ CALL_ME_BARGE_IN: "1" }), "One. Two.", "https://x/g");
+  assert.match(interruptible, /<Response><Gather [^>]*><Say[^>]*>One\. Two\.<\/Say><\/Gather>/);
 });
