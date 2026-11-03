@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   parseEnv, loadConfig, buildCallTwiml, buildLiveTurnTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
-  normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName,
+  normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName, e164, projectConfigPath,
   classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
 } from "../plugins/call-me/server/lib.mjs";
 
@@ -134,4 +134,15 @@ test("live line plays in full unless barge-in is enabled", () => {
   assert.match(full, /<Response><Say[^>]*>One\. Two\.<\/Say><Gather /);
   const interruptible = buildLiveTurnTwiml(speechProfile({ CALL_ME_BARGE_IN: "1" }), "One. Two.", "https://x/g");
   assert.match(interruptible, /<Response><Gather [^>]*><Say[^>]*>One\. Two\.<\/Say><\/Gather>/);
+});
+
+test("e164 normalises formatting and rejects non-numbers", () => {
+  assert.equal(e164("+1 (725) 000-0002"), "+17250000002");
+  assert.throws(() => e164("725 000 0002"), /E\.164/);
+  assert.throws(() => e164("+0123"), /E\.164/);
+});
+
+test("projectConfigPath gives each project directory its own file", () => {
+  assert.equal(projectConfigPath("/home/a/my proj", "/cfg/config.env"), "/cfg/projects/home-a-my-proj.env");
+  assert.notEqual(projectConfigPath("/home/a/x"), projectConfigPath("/home/a/y"));
 });

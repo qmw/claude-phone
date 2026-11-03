@@ -29,16 +29,43 @@ export function parseEnv(text) {
   return out;
 }
 
-/** Config = config file, overridden by process env. */
-export function loadConfig(env = process.env, file = CONFIG_PATH) {
-  let fromFile = {};
+/** Per-project settings (numbers, language) live next to the main config, one file per project directory. */
+export function projectConfigPath(cwd = process.cwd(), configPath = CONFIG_PATH) {
+  return path.join(path.dirname(configPath), "projects", cwd.replace(/[^A-Za-z0-9._]+/g, "-").replace(/^-+/, "") + ".env");
+}
+
+const readEnvFile = (file) => {
   try {
-    fromFile = parseEnv(fs.readFileSync(file, "utf8"));
-  } catch {}
-  const cfg = { ...fromFile };
+    return parseEnv(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+};
+
+/** Config = config file < project file < process env < this session's overrides. */
+export function loadConfig(env = process.env, file = CONFIG_PATH, projectFile = null, overrides = {}) {
+  const cfg = { ...readEnvFile(file), ...(projectFile ? readEnvFile(projectFile) : {}) };
   for (const [k, v] of Object.entries(env)) if ((k.startsWith("TWILIO_") || k.startsWith("CALL_ME_")) && v) cfg[k] = v;
+  Object.assign(cfg, overrides);
   const missing = REQUIRED_KEYS.filter((k) => !cfg[k]);
   return { cfg, missing };
+}
+
+/** Merge `values` into a KEY=VALUE file (empty string removes a key); written with mode 600. */
+export function updateEnvFile(file, values) {
+  const cur = readEnvFile(file);
+  for (const [k, v] of Object.entries(values)) v === "" ? delete cur[k] : (cur[k] = v);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const text = Object.entries(cur).map(([k, v]) => `${k}="${String(v).replace(/"/g, "")}"`).join("\n") + "\n";
+  fs.writeFileSync(file, text, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+/** "+48 600-000-001" -> "+48600000001"; throws unless it looks like E.164. */
+export function e164(n) {
+  const s = String(n).replace(/[\s().-]/g, "");
+  if (!/^\+[1-9]\d{6,14}$/.test(s)) throw new Error(`"${n}" is not a phone number in E.164 format (+countrycode…)`);
+  return s;
 }
 
 export function xmlEscape(s) {

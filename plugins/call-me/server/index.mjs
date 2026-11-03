@@ -13,6 +13,10 @@ import readline from "node:readline";
 import {
   CONFIG_PATH,
   loadConfig,
+  projectConfigPath,
+  updateEnvFile,
+  e164,
+  normalizeLanguage,
   speechProfile,
   buildCallTwiml,
   buildSayHangupTwiml,
@@ -32,11 +36,18 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Settings: machine config file < this project's file < env < changes made in this session (call_me_settings).
+const PROJECT_FILE = projectConfigPath();
+const sessionOverrides = {};
+const config = () => loadConfig(process.env, CONFIG_PATH, PROJECT_FILE, sessionOverrides);
+/** Whether this session should own its Twilio number and answer calls to it. */
+const answering = (cfg) => INBOUND && !NO.test(cfg.CALL_ME_ANSWER || "");
 
 // ---------------------------------------------------------------- Twilio REST
 
@@ -129,8 +140,9 @@ function readBody(req) {
   });
 }
 
-async function startServer(cfg) {
+async function startServer(initial) {
   const server = http.createServer(async (req, res) => {
+    const { cfg } = config();
     const url = new URL(req.url, "http://x");
     if (url.pathname === "/health") return res.end("ok");
     const outbound = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
@@ -211,7 +223,7 @@ async function startServer(cfg) {
     }
     res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
   });
-  const port = Number(cfg.CALL_ME_PORT || 0);
+  const port = Number(initial.CALL_ME_PORT || 0);
   await new Promise((r) => server.listen(port, "127.0.0.1", r));
   return server.address().port;
 }
@@ -293,7 +305,7 @@ async function ensureWebhook(cfg) {
 
 // --------------------------------------------- inbound: own the Twilio number
 
-let ownedNumber = null; // { sid, voiceUrl } while this session answers calls
+let ownedNumber = null; // { sid, phone, voiceUrl } while this session answers calls
 
 async function claimNumber(cfg) {
   const { publicUrl } = await ensureWebhook(cfg);
@@ -309,14 +321,14 @@ async function claimNumber(cfg) {
     VoiceFallbackUrl: offline,
     VoiceFallbackMethod: "GET",
   });
-  ownedNumber = { sid: num.sid, voiceUrl };
+  ownedNumber = { sid: num.sid, phone: num.phone_number, voiceUrl };
   log(`answering calls to ${cfg.TWILIO_FROM_NUMBER}`);
 }
 
 /** Point the number back at the offline message — unless a newer session has taken it over. */
 async function releaseNumber() {
   if (!ownedNumber) return;
-  const { cfg } = loadConfig();
+  const { cfg } = config();
   const { sid, voiceUrl } = ownedNumber;
   ownedNumber = null;
   const num = await twilio(cfg, "GET", `IncomingPhoneNumbers/${sid}.json`);
@@ -404,7 +416,7 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds,
 }
 
 async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false }) {
-  const { cfg, missing } = loadConfig();
+  const { cfg, missing } = config();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
@@ -455,7 +467,7 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
 
 /** Say the next line on a live call and return what the user says back. */
 async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120 }) {
-  const { cfg } = loadConfig();
+  const { cfg } = config();
   const e = live.get(call_sid);
   if (!e) throw new Error(`No live call ${call_sid}. Use call_me to call the user.`);
   if (e.ended) {
@@ -493,6 +505,88 @@ async function phoneReply({ call_sid, message, end_call = false, timeout_seconds
       : `The call has ended (${e.ended}).` + (e.lines.length ? " Your line was not said." : "");
   }
   return `No reply within ${timeout_seconds}s; the user is still on hold. Call phone_reply again or end the call with end_call: true.`;
+}
+
+/** Where a Twilio number's calls currently go, judged from its voice URL. */
+function numberOwner(n) {
+  const url = n.voice_url || "";
+  if (ownedNumber && url === ownedNumber.voiceUrl) return "answered by THIS session";
+  if (/trycloudflare\.com\/incoming$/.test(url)) return "answered by another call-me session";
+  if (/twimlets\.com\/echo/.test(url)) return "free (plays the offline message)";
+  return url ? "used by another app" : "free (no voice URL)";
+}
+
+const SETTING_KEYS = {
+  from_number: "TWILIO_FROM_NUMBER",
+  to_number: "CALL_ME_TO_NUMBER",
+  allowed_callers: "CALL_ME_ALLOWED_CALLERS",
+  language: "CALL_ME_LANGUAGE",
+  answer_calls: "CALL_ME_ANSWER",
+};
+
+/** Show or change this session's numbers (call_me_settings tool). */
+async function settings({ scope = "project", list_numbers = false, ...args }) {
+  if (!["project", "session"].includes(scope)) throw new Error('scope must be "project" or "session"');
+  const values = {};
+  for (const [arg, key] of Object.entries(SETTING_KEYS)) {
+    const v = args[arg];
+    if (v === undefined || v === null) continue;
+    if (v === "") values[key] = "";
+    else if (arg === "allowed_callers")
+      values[key] = (Array.isArray(v) ? v : String(v).split(",")).map((x) => String(x).trim()).filter(Boolean).map(e164).join(",");
+    else if (arg === "language") values[key] = normalizeLanguage(v);
+    else if (arg === "answer_calls") values[key] = v === true || /^(1|true|yes)$/i.test(String(v)) ? "1" : "0";
+    else values[key] = e164(v);
+  }
+
+  let { cfg } = config();
+  if (values.TWILIO_FROM_NUMBER) {
+    const list = await twilio(cfg, "GET", `IncomingPhoneNumbers.json?PhoneNumber=${encodeURIComponent(values.TWILIO_FROM_NUMBER)}`);
+    if (!list.incoming_phone_numbers?.length)
+      throw new Error(`${values.TWILIO_FROM_NUMBER} is not a number on this Twilio account. Buy it in the Twilio console first.`);
+  }
+  if (Object.keys(values).length) {
+    if (scope === "project") {
+      updateEnvFile(PROJECT_FILE, values);
+      for (const k of Object.keys(values)) delete sessionOverrides[k];
+    } else {
+      for (const [k, v] of Object.entries(values)) v === "" ? delete sessionOverrides[k] : (sessionOverrides[k] = v);
+    }
+  }
+
+  // Follow the new settings: hand back a number this session should no longer answer, take over the new one.
+  const notes = [];
+  ({ cfg } = config());
+  const want = answering(cfg) && !!cfg.TWILIO_FROM_NUMBER;
+  if (ownedNumber && (!want || ownedNumber.phone !== cfg.TWILIO_FROM_NUMBER)) {
+    const old = ownedNumber.phone;
+    await releaseNumber();
+    notes.push(`Stopped answering ${old}.`);
+  }
+  if (want && !ownedNumber) {
+    await claimNumber(cfg);
+    notes.push(`Now answering calls to ${cfg.TWILIO_FROM_NUMBER}.`);
+  }
+  if (!INBOUND && !NO.test(cfg.CALL_ME_ANSWER || "1"))
+    notes.push("This session can't receive calls because it wasn't started with the claude-phone launcher. Restart it that way to answer calls to its number.");
+  for (const k of Object.keys(values))
+    if (process.env[k] && scope === "project") notes.push(`${k} is also set in the environment, which overrides the project setting.`);
+
+  const shown = (k) => cfg[k] || "(not set)";
+  let out =
+    `call-me settings for this session (${scope === "project" ? `saved for this project in ${PROJECT_FILE}` : "this session only"}):\n` +
+    `- from_number (this session's Twilio number; calls come from it and you dial it to reach this session): ${shown("TWILIO_FROM_NUMBER")}\n` +
+    `- to_number (the phone this session calls): ${shown("CALL_ME_TO_NUMBER")}\n` +
+    `- allowed_callers (may call this session, besides to_number): ${cfg.CALL_ME_ALLOWED_CALLERS || "(none)"}\n` +
+    `- language: ${cfg.CALL_ME_LANGUAGE || "en-US"}\n` +
+    `- answer_calls: ${ownedNumber ? `yes, answering ${ownedNumber.phone}` : answering(cfg) ? "yes, but not answering yet" : "no"}`;
+  if (notes.length) out += "\n\n" + notes.join("\n");
+
+  if (list_numbers) {
+    const nums = (await twilio(cfg, "GET", "IncomingPhoneNumbers.json?PageSize=100")).incoming_phone_numbers || [];
+    out += "\n\nTwilio numbers on the account:\n" + nums.map((n) => `- ${n.phone_number}: ${numberOwner(n)}`).join("\n");
+  }
+  return out;
 }
 
 const TOOLS = [
@@ -546,6 +640,31 @@ const TOOLS = [
       required: ["call_sid", "message"],
     },
   },
+  {
+    name: "call_me_settings",
+    description:
+      "Show or change this session's phone numbers: which Twilio number it calls from and answers (from_number), which phone it calls (to_number), " +
+      "which other phones may call it (allowed_callers), its language, and whether it answers calls (answer_calls). " +
+      "With no arguments it just shows the current settings. Changes are saved for this project directory (scope project, the default) " +
+      "or kept for this session only (scope session). Pass an empty string to reset a value to the machine default. " +
+      "list_numbers shows the Twilio numbers on the account and which are already in use. Only change settings the user asked to change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_number: { type: "string", description: "This session's Twilio number (E.164). Must be on the Twilio account." },
+        to_number: { type: "string", description: "The phone this session calls (E.164)." },
+        allowed_callers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Other phones allowed to call this session (E.164). to_number is always allowed. [] clears the list.",
+        },
+        language: { type: "string", enum: ["en-US", "pl-PL", ""], description: "Default language for this session's calls." },
+        answer_calls: { type: "boolean", description: "Answer calls to from_number (needs a session started with claude-phone)." },
+        scope: { type: "string", enum: ["project", "session"], default: "project", description: "Save for this project (default) or this session only." },
+        list_numbers: { type: "boolean", description: "Also list the Twilio numbers on the account and who uses each." },
+      },
+    },
+  },
 ];
 
 // ------------------------------------------------------------- MCP over stdio
@@ -565,9 +684,9 @@ async function handle(msg) {
   const { id, method, params } = msg;
   if (id === undefined) {
     if (method === "notifications/initialized" && INBOUND) {
-      const { cfg, missing } = loadConfig();
+      const { cfg, missing } = config();
       if (missing.length) log("CALL_ME_INBOUND set but call-me is not configured");
-      else claimNumber(cfg).catch((e) => log(`could not take over the number: ${e.message}`));
+      else if (answering(cfg)) claimNumber(cfg).catch((e) => log(`could not take over the number: ${e.message}`));
     }
     return;
   }
@@ -589,7 +708,7 @@ async function handle(msg) {
         result = { tools: TOOLS };
         break;
       case "tools/call": {
-        const tool = { call_me: callMe, phone_reply: phoneReply }[params?.name];
+        const tool = { call_me: callMe, phone_reply: phoneReply, call_me_settings: settings }[params?.name];
         if (!tool) throw Object.assign(new Error(`Unknown tool ${params?.name}`), { code: -32602 });
         try {
           result = { content: [{ type: "text", text: await tool(params.arguments || {}) }] };
@@ -619,5 +738,5 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 });
 process.stdin.on("end", shutdown);
 
-const { missing } = loadConfig();
+const { missing } = config();
 log(missing.length ? `not configured yet (missing ${missing.join(", ")}; see ${CONFIG_PATH})` : "ready");

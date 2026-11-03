@@ -3,7 +3,10 @@
 // FAKE_CALLS="no-answer;completed:machine_start;completed:human:12" scripts the outcome of each placed call
 // (status[:answered_by[:duration]]); without it calls stay in-progress.
 const realFetch = globalThis.fetch;
-const number = { sid: "PN1", voice_url: "" };
+const numbers = [
+  { sid: "PN1", phone_number: "+17250000000", voice_url: "" },
+  { sid: "PN2", phone_number: "+17250000002", voice_url: "" },
+];
 const script = (process.env.FAKE_CALLS || "").split(";").filter(Boolean);
 const calls = {};
 globalThis.fetch = async (url, opts = {}) => {
@@ -13,8 +16,11 @@ globalThis.fetch = async (url, opts = {}) => {
   const form = opts.body ? Object.fromEntries(new URLSearchParams(opts.body)) : {};
   process.stderr.write(`TWILIO ${JSON.stringify({ method, path: u.pathname + u.search, form })}\n`);
   let body = {};
-  if (u.pathname.endsWith("/IncomingPhoneNumbers.json")) body = { incoming_phone_numbers: [number] };
-  else if (u.pathname.endsWith("/IncomingPhoneNumbers/PN1.json")) {
+  if (u.pathname.endsWith("/IncomingPhoneNumbers.json")) {
+    const want = u.searchParams.get("PhoneNumber");
+    body = { incoming_phone_numbers: numbers.filter((n) => !want || n.phone_number === want) };
+  } else if (/\/IncomingPhoneNumbers\/PN\d\.json$/.test(u.pathname)) {
+    const number = numbers.find((n) => u.pathname.endsWith(`/${n.sid}.json`));
     if (method === "POST" && form.VoiceUrl) number.voice_url = form.VoiceUrl;
     body = number;
   } else if (u.pathname.endsWith("/Calls.json")) {

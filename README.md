@@ -4,6 +4,10 @@ A Claude Code plugin that lets Claude **phone you**. Claude speaks a message alo
 
 It also works the other way: **you can call Claude.** Start a session with `claude-phone` (see [Calling Claude](#calling-claude-inbound)), dial your Twilio number, and say what you want. Your words arrive in that session and Claude starts working.
 
+Each session or project can have **its own Twilio number**. Calls from it show that number, dialling it reaches that session, and you choose who it calls and who may call it.
+
+The plugin contains an **MCP server** with three tools (`call_me`, `phone_reply`, `call_me_settings`) and **slash commands**: `/call-me:setup`, `/call-me:session` and `/call-me:test`. Claude uses the tools; you use the commands.
+
 - No dependencies: one Node.js MCP server (Node ≥ 18).
 - Your reply comes back through a webhook. A free Cloudflare quick tunnel exposes it, and no account is needed. If `cloudflared` isn't on your PATH, the plugin downloads it to `~/.cache/claude-call-me/` on the first call that waits for a reply.
 - Webhook requests are checked against Twilio's `X-Twilio-Signature` and an unguessable per-call path.
@@ -11,7 +15,7 @@ It also works the other way: **you can call Claude.** Start a session with `clau
 ## Install (once per machine; then available in every session)
 
 ```bash
-claude plugin marketplace add git@github-qmw:qmw/claude-call-me.git
+claude plugin marketplace add qmw/claude-call-me
 claude plugin install call-me@claude-call-me
 ```
 
@@ -24,7 +28,7 @@ Then, inside Claude Code:
 
 Or set up the config by hand: copy `plugins/call-me/config.example.env` to `~/.config/claude-call-me/config.env`, fill it in, and `chmod 600` it.
 
-Update later with `claude plugin marketplace update claude-call-me`.
+Update later with `claude plugin marketplace update claude-call-me && claude plugin update call-me@claude-call-me`, then restart Claude Code.
 
 ### Twilio prerequisites
 
@@ -96,21 +100,26 @@ While Claude thinks, you hear silence. After 4 seconds you hear "one moment", an
 
 Claude always finishes its line, and it starts listening when the line ends, so anything you say during the line isn't heard. Set `CALL_ME_BARGE_IN=1` to be able to interrupt by talking, but then any sound on your side, including background noise, can cut the line off. If you stay silent twice after a line, the call ends.
 
+## A number per session
+
+Every session can have its own Twilio number, so you can call the session you want and know which one is calling you. Inside a session, run `/call-me:session`, or just tell Claude, for example *"use +17255550123 for this project, call my work phone, and let my private phone call you"*. Claude then sets these with the `call_me_settings` tool:
+
+| Setting | Meaning |
+| --- | --- |
+| `from_number` | The session's own Twilio number. Its calls come from this number, and dialling it reaches this session. It must be on your Twilio account. |
+| `to_number` | The phone the session calls. It is also allowed to call in. |
+| `allowed_callers` | Other phones allowed to call the session. |
+| `language`, `answer_calls` | The session's default call language, and whether it answers its number. |
+
+Settings are saved for the **project directory**, in `~/.config/claude-call-me/projects/<dir>.env`, so a resumed or new session in the same project keeps them. Pass `scope: "session"` for a change that lasts only until the session ends. Anything not set falls back to the machine config. A change takes effect immediately: the session releases its old number and takes over the new one.
+
+To answer calls, the session must be started with the `claude-phone` launcher. `list_numbers` shows every number on the account and whether a session already answers it. If two sessions use the same number, the one that claimed it last answers.
+
+Saved messages and do-not-disturb are shared by all sessions on a machine. If you reject a call from one session, the others hold their calls too, until you call any of them back.
+
 ## Several machines
 
-Give each machine **its own Twilio number**. You then dial the machine you want, and its calls to you show its number. Every number can live on the same Twilio account, but a trial account allows only one number.
-
-On each extra machine:
-
-1. Give the machine access to this private repo: copy or create the `github-qmw` SSH key and the `Host github-qmw` entry in `~/.ssh/config`, or add a read-only deploy key to the repo.
-2. Install the plugin the same way: `claude plugin marketplace add …` and `claude plugin install …`.
-3. Write `~/.config/claude-call-me/config.env`. Use the same `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, but a different `TWILIO_FROM_NUMBER`. Set `CALL_ME_MACHINE` to a name you'll recognise.
-4. Optionally set a different `CALL_ME_TO_NUMBER` per machine, for example a work SIM. Put any other phones you call from in `CALL_ME_ALLOWED_CALLERS`.
-5. Create the `claude-phone` launcher there as well.
-
-Saved messages and do-not-disturb are per machine. Rejecting a call from machine A doesn't hold calls from machine B.
-
-Don't run `claude-phone` on two machines with the **same** Twilio number: the session started last takes it over.
+The same works across machines. Install the plugin on each machine, run `/call-me:setup` with the same Twilio account, and give each machine, or each project on it, its own number. `CALL_ME_MACHINE` names the machine in inbound call events. The default is the hostname.
 
 **Cost tip:** Twilio numbers in your own country make calling Claude a domestic call. A Polish geographic number is about $3 a month, and calls to it fall under unlimited domestic minutes. Calling a US number from Poland is billed as international. Polish numbers need a Twilio regulatory bundle: an ID, plus an address in the area of the number's prefix.
 
@@ -136,11 +145,12 @@ Don't run `claude-phone` on two machines with the **same** Twilio number: the se
 | `CALL_ME_STATE_DIR` | | Where saved messages are kept (default `~/.local/state/claude-call-me`) |
 | `CALL_ME_LIVE` | | `0` = inbound calls hang up after you speak instead of staying open (default on) |
 | `CALL_ME_LIVE_HOLD` | | Seconds you are kept on hold waiting for Claude's next line (default 120) |
+| `CALL_ME_ANSWER` | | `0` = don't answer calls even when started with `claude-phone` (usually set per project with `call_me_settings`) |
 | `CALL_ME_INBOUND` | | `1` = take over the number and answer calls (set by the `claude-phone` launcher) |
 | `CALL_ME_PUBLIC_URL` | | Use your own public URL instead of cloudflared |
 | `CALL_ME_PORT` | | Local webhook port (default: random) |
 
-Environment variables with the same names override the file. `CALL_ME_CONFIG` points to a different config file.
+Settings are applied in this order, later ones winning: the machine config file, the project file written by `call_me_settings`, environment variables with the same names, and changes made with `scope: "session"`. `CALL_ME_CONFIG` points to a different config file.
 
 ## Development
 
@@ -148,3 +158,7 @@ Environment variables with the same names override the file. `CALL_ME_CONFIG` po
 npm test
 claude --plugin-dir plugins/call-me   # try local changes without installing
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

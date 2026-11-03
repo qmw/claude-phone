@@ -186,7 +186,7 @@ test("live conversation: inbound and outbound calls stay open for phone_reply", 
     await s.until(() => s.stdout.some((m) => m.id === 1));
     s.send({ id: 9, method: "tools/list" });
     await s.until(() => s.stdout.some((m) => m.id === 9));
-    assert.deepEqual(s.stdout.find((m) => m.id === 9).result.tools.map((t) => t.name), ["call_me", "phone_reply"]);
+    assert.deepEqual(s.stdout.find((m) => m.id === 9).result.tools.map((t) => t.name), ["call_me", "phone_reply", "call_me_settings"]);
     s.send({ method: "notifications/initialized" });
     await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
 
@@ -228,6 +228,69 @@ test("live conversation: inbound and outbound calls stay open for phone_reply", 
     for (let i = 0; i < 20 && !/Gather/.test((await webhook("/live/wait", { CallSid: "CA1" })).body); i++) await new Promise((r) => setTimeout(r, 50));
     assert.match((await webhook("/live/gather", { CallSid: "CA1" })).body, /Nie otrzymałem odpowiedzi.*<Hangup\/>/);
     assert.match(await result(6), /said nothing/);
+  } finally {
+    s.proc.kill();
+  }
+});
+
+test("call_me_settings: each session/project picks its own numbers and answers its own number", async () => {
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "cm-cfg-"));
+  // Numbers come from the machine config file here (environment variables would override project settings).
+  fs.writeFileSync(path.join(cfgDir, "config.env"), `TWILIO_FROM_NUMBER=+17250000000\nCALL_ME_TO_NUMBER=${ME}\n`);
+  const s = startServer({ CALL_ME_CONFIG: path.join(cfgDir, "config.env"), CALL_ME_ALLOWED_CALLERS: "", TWILIO_FROM_NUMBER: "", CALL_ME_TO_NUMBER: "" });
+  let id = 10;
+  const settings = async (args) => {
+    const n = ++id;
+    s.send({ id: n, method: "tools/call", params: { name: "call_me_settings", arguments: args } });
+    await s.until(() => s.stdout.some((m) => m.id === n), 10000);
+    const r = s.stdout.find((m) => m.id === n).result;
+    return { text: r.content[0].text, error: !!r.isError };
+  };
+  const voiceUrls = () => s.twilio.filter((r) => r.form.VoiceUrl);
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    await s.until(() => s.stdout.some((m) => m.id === 1));
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => voiceUrls().length === 1);
+    assert.match(voiceUrls()[0].path, /PN1\.json$/);
+
+    // Show current settings.
+    assert.match((await settings({})).text, /from_number[^:]*: \+17250000000[\s\S]*answer_calls: yes, answering \+17250000000/);
+
+    // Unknown Twilio number and malformed numbers are refused.
+    assert.match((await settings({ from_number: "+17259999999" })).text, /not a number on this Twilio account/);
+    assert.ok((await settings({ to_number: "12345" })).error);
+
+    // Switch this project to the second number: release PN1, take over PN2; save to the project file.
+    const r = await settings({ from_number: "+1 725 000 0002", to_number: "+48600000009", allowed_callers: ["+48600000010"] });
+    assert.match(r.text, /Stopped answering \+17250000000[\s\S]*Now answering calls to \+17250000002/);
+    const [release, claim] = voiceUrls().slice(-2);
+    assert.match(release.path, /PN1\.json$/);
+    assert.match(release.form.VoiceUrl, /twimlets/);
+    assert.match(claim.path, /PN2\.json$/);
+    const projectFiles = fs.readdirSync(path.join(cfgDir, "projects"));
+    assert.equal(projectFiles.length, 1);
+    const saved = fs.readFileSync(path.join(cfgDir, "projects", projectFiles[0]), "utf8");
+    assert.match(saved, /TWILIO_FROM_NUMBER="\+17250000002"/);
+    assert.match(saved, /CALL_ME_TO_NUMBER="\+48600000009"/);
+    assert.equal(fs.statSync(path.join(cfgDir, "projects", projectFiles[0])).mode & 0o777, 0o600);
+
+    // The new caller list applies at once: the new to_number and allowed caller get through, the old phone does not.
+    assert.match((await webhook("/incoming", { From: "+48600000010", CallSid: "CAa" })).body, /<Gather/);
+    assert.match((await webhook("/incoming", { From: "+48600000009", CallSid: "CAb" })).body, /<Gather/);
+    assert.match((await webhook("/incoming", { From: ME, CallSid: "CAc" })).body, /<Reject\/>/);
+
+    // Outbound calls come from the session's number.
+    s.send({ id: 99, method: "tools/call", params: { name: "call_me", arguments: { message: "hi", wait_for_reply: false, retries: 0 } } });
+    await s.until(() => s.twilio.some((r) => r.form.Twiml));
+    const call = s.twilio.find((r) => r.form.Twiml).form;
+    assert.equal(call.From, "+17250000002");
+    assert.equal(call.To, "+48600000009");
+
+    // Session-only change to stop answering; list numbers.
+    const off = await settings({ answer_calls: false, scope: "session", list_numbers: true });
+    assert.match(off.text, /answer_calls: no[\s\S]*Stopped answering \+17250000002/);
+    assert.match(off.text, /\+17250000002: free \(plays the offline message\)/);
   } finally {
     s.proc.kill();
   }
