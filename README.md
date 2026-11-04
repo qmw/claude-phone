@@ -19,6 +19,8 @@ claude plugin marketplace add qmw/claude-phone
 claude plugin install call-me@claude-phone
 ```
 
+Or in one step, from the terminal or inside Claude Code: `/plugin install call-me --marketplace qmw/claude-phone`. Use `claude plugin install …` from a shell.
+
 Then, inside Claude Code:
 
 ```
