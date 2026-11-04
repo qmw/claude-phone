@@ -1,4 +1,4 @@
-# claude-call-me
+# claude-phone
 
 A Claude Code plugin that lets Claude **phone you**. Claude speaks a message aloud using Twilio text-to-speech, then listens for your spoken or keypad reply and returns it to the session. Use it for "call me when the build finishes" or "call me if you're blocked."
 
@@ -15,8 +15,8 @@ The plugin contains an **MCP server** with three tools (`call_me`, `phone_reply`
 ## Install (once per machine; then available in every session)
 
 ```bash
-claude plugin marketplace add qmw/claude-call-me
-claude plugin install call-me@claude-call-me
+claude plugin marketplace add qmw/claude-phone
+claude plugin install call-me@claude-phone
 ```
 
 Then, inside Claude Code:
@@ -28,7 +28,7 @@ Then, inside Claude Code:
 
 Or set up the config by hand: copy `plugins/call-me/config.example.env` to `~/.config/claude-call-me/config.env`, fill it in, and `chmod 600` it.
 
-Update later with `claude plugin marketplace update claude-call-me && claude plugin update call-me@claude-call-me`, then restart Claude Code.
+Update later with `claude plugin marketplace update claude-phone && claude plugin update call-me@claude-phone`, then restart Claude Code.
 
 ### Twilio prerequisites
 
@@ -73,7 +73,7 @@ This uses Claude Code [channels](https://code.claude.com/docs/en/channels), a re
 ```bash
 #!/usr/bin/env bash
 export CALL_ME_INBOUND=1
-exec claude --dangerously-load-development-channels plugin:call-me@claude-call-me "$@"
+exec claude --dangerously-load-development-channels plugin:call-me@claude-phone "$@"
 ```
 
 Use it like `claude`, e.g. `claude-phone --resume <session-id>`. Channels can only be enabled when a session starts, so a session already running under plain `claude` must be restarted this way.

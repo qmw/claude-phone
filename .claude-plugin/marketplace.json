@@ -1,5 +1,5 @@
 {
-  "name": "claude-call-me",
+  "name": "claude-phone",
   "owner": { "name": "qmw" },
   "description": "Claude Code plugin that lets Claude phone you and hear your reply.",
   "plugins": [
