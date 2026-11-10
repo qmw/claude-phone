@@ -36,7 +36,7 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.6.2";
+const VERSION = "0.6.3";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);

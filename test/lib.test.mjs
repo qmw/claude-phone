@@ -150,3 +150,21 @@ test("projectConfigPath gives each project directory its own file", () => {
   assert.equal(projectConfigPath("/home/a/my proj", "/cfg/config.env"), "/cfg/projects/home-a-my-proj.env");
   assert.notEqual(projectConfigPath("/home/a/x"), projectConfigPath("/home/a/y"));
 });
+
+test("a project switching language does not inherit the machine config's voice and phrases", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cm-lang-"));
+  const machine = path.join(dir, "config.env"), project = path.join(dir, "project.env");
+  fs.writeFileSync(machine, 'CALL_ME_LANGUAGE=pl-PL\nCALL_ME_VOICE=Polly.Ewa\nCALL_ME_INTRO="Cześć, tu Claude."\n');
+  fs.writeFileSync(project, "CALL_ME_LANGUAGE=en-US\n");
+  const { cfg } = loadConfig({}, machine, project);
+  const en = speechProfile(cfg);
+  assert.equal(en.language, "en-US");
+  assert.equal(en.voice, "Polly.Joanna");
+  assert.doesNotMatch(en.intro, /Cześć/);
+  // A Polish call from that project still gets the machine's Polish voice and intro.
+  const pl = speechProfile(cfg, "pl-PL");
+  assert.equal(pl.voice, "Polly.Ewa");
+  assert.equal(pl.intro, "Cześć, tu Claude.");
+  // Without a project file, nothing changes.
+  assert.equal(speechProfile(loadConfig({}, machine).cfg).voice, "Polly.Ewa");
+});

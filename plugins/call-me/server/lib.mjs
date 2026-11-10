@@ -43,10 +43,22 @@ const readEnvFile = (file) => {
 };
 
 /** Config = config file < project file < process env < this session's overrides. */
+const PHRASE_KEYS = ["CALL_ME_VOICE", "CALL_ME_INTRO", "CALL_ME_REPLY_PROMPT", "CALL_ME_ACK"];
+
 export function loadConfig(env = process.env, file = CONFIG_PATH, projectFile = null, overrides = {}) {
-  const cfg = { ...readEnvFile(file), ...(projectFile ? readEnvFile(projectFile) : {}) };
-  for (const [k, v] of Object.entries(env)) if ((k.startsWith("TWILIO_") || k.startsWith("CALL_ME_")) && v) cfg[k] = v;
-  Object.assign(cfg, overrides);
+  const fromEnv = Object.fromEntries(
+    Object.entries(env).filter(([k, v]) => (k.startsWith("TWILIO_") || k.startsWith("CALL_ME_")) && v),
+  );
+  const cfg = {};
+  // A voice or phrase belongs to the language that was in effect where it was set: a Polish voice in the
+  // machine config must not be used when a project switches to English.
+  const phraseLanguage = {};
+  for (const layer of [readEnvFile(file), projectFile ? readEnvFile(projectFile) : {}, fromEnv, overrides]) {
+    Object.assign(cfg, layer);
+    const lang = normalizeLanguage(cfg.CALL_ME_LANGUAGE) || "en-US";
+    for (const k of PHRASE_KEYS) if (k in layer) phraseLanguage[k] = lang;
+  }
+  Object.defineProperty(cfg, "phraseLanguage", { value: phraseLanguage, enumerable: false });
   const missing = REQUIRED_KEYS.filter((k) => !cfg[k]);
   return { cfg, missing };
 }
@@ -132,12 +144,12 @@ export function speechProfile(cfg, requested) {
   const language = normalizeLanguage(requested) || def;
   // Seconds of silence that end the user's turn. Twilio's "auto" cut people off at their first pause.
   const p = { ...LANGUAGES[language], language, speechTimeout: xmlEscape(cfg.CALL_ME_SPEECH_TIMEOUT || "3"), bargeIn: cfg.CALL_ME_BARGE_IN === "1" };
-  if (language === def) {
-    if (cfg.CALL_ME_VOICE) p.voice = cfg.CALL_ME_VOICE;
-    if (cfg.CALL_ME_INTRO !== undefined) p.intro = cfg.CALL_ME_INTRO;
-    if (cfg.CALL_ME_REPLY_PROMPT !== undefined) p.prompt = cfg.CALL_ME_REPLY_PROMPT;
-    if (cfg.CALL_ME_ACK !== undefined) p.ack = cfg.CALL_ME_ACK;
-  }
+  // Overrides apply only to calls in the language they were set for (see loadConfig).
+  const mine = (k) => cfg[k] !== undefined && (cfg.phraseLanguage?.[k] ?? def) === language;
+  if (mine("CALL_ME_VOICE") && cfg.CALL_ME_VOICE) p.voice = cfg.CALL_ME_VOICE;
+  if (mine("CALL_ME_INTRO")) p.intro = cfg.CALL_ME_INTRO;
+  if (mine("CALL_ME_REPLY_PROMPT")) p.prompt = cfg.CALL_ME_REPLY_PROMPT;
+  if (mine("CALL_ME_ACK")) p.ack = cfg.CALL_ME_ACK;
   return p;
 }
 
