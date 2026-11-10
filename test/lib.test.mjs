@@ -34,6 +34,10 @@ test("twiml escapes message and includes gather only when replying", () => {
   assert.match(buildCallTwiml("hi", speechProfile({ CALL_ME_SPEECH_TIMEOUT: "5" }), "https://x/g"), /speechTimeout="5"/);
   assert.match(twoWay, /Nie dosłyszałem/);
   assert.doesNotMatch(twoWay, /didn't catch/);
+  // No "say your reply now" by default: the first Gather just listens, without an empty <Say>.
+  assert.match(twoWay, /<Gather [^>]*><\/Gather>/);
+  assert.doesNotMatch(twoWay, /<Say[^>]*><\/Say>|naciśnij/);
+  assert.match(buildCallTwiml("hi", speechProfile({ CALL_ME_REPLY_PROMPT: "Mów." }), "https://x/g"), /<Gather [^>]*><Say[^>]*>Mów\.<\/Say>/);
 });
 
 test("normalizeLanguage accepts short forms and rejects unsupported", () => {

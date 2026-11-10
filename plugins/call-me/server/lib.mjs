@@ -77,7 +77,7 @@ export const LANGUAGES = {
   "en-US": {
     voice: "Polly.Joanna",
     intro: "Hi, this is Claude.",
-    prompt: "Please say your reply now, or press a key.",
+    prompt: "", // no "say your reply now": the message ends with a question, and people just answer
     retry: "I didn't catch that.",
     noReply: "No reply received. Goodbye.",
     ack: "Got it, thanks. Goodbye.",
@@ -95,7 +95,7 @@ export const LANGUAGES = {
   "pl-PL": {
     voice: "Polly.Ewa",
     intro: "Cześć, tu Claude.",
-    prompt: "Powiedz swoją odpowiedź teraz albo naciśnij klawisz.",
+    prompt: "",
     retry: "Nie dosłyszałem.",
     noReply: "Nie otrzymałem odpowiedzi. Do usłyszenia.",
     ack: "Dzięki, przyjąłem. Do usłyszenia.",
@@ -142,7 +142,10 @@ export function speechProfile(cfg, requested) {
 }
 
 const XML = `<?xml version="1.0" encoding="UTF-8"?>`;
-const say = (p, text) => `<Say voice="${xmlEscape(p.voice)}" language="${p.language}">${xmlEscape(text)}</Say>`;
+const say = (p, text) =>
+  !String(text ?? "").trim()
+    ? ""
+    : `<Say voice="${xmlEscape(p.voice)}" language="${p.language}">${xmlEscape(text)}</Say>`;
 const gather = (p, url, inner, input = "speech dtmf", onEmpty = false) =>
   `<Gather input="${input}" action="${xmlEscape(url)}" method="POST" timeout="10" speechTimeout="${p.speechTimeout}" ` +
   `actionOnEmptyResult="${onEmpty}" language="${p.language}">${inner}</Gather>`;
@@ -154,7 +157,7 @@ export function buildCallTwiml(message, p, gatherUrl) {
   x += say(p, message);
   if (gatherUrl) {
     x += gather(p, gatherUrl, say(p, p.prompt));
-    x += gather(p, gatherUrl, say(p, `${p.retry} ${message} ${p.prompt}`));
+    x += gather(p, gatherUrl, say(p, `${p.retry} ${message} ${p.prompt}`.trim()));
     x += say(p, p.noReply);
   }
   return x + `</Response>`;

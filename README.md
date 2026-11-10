@@ -147,7 +147,7 @@ $env:CALL_ME_INBOUND = "1"; claude --dangerously-load-development-channels plugi
 | `CALL_ME_MACHINE` | | Name of this machine, reported with inbound calls (default: hostname) |
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |
 | `CALL_ME_VOICE` | | Voice for the default language. Built-in voices: `Polly.Joanna` (en-US), `Polly.Ewa` (pl-PL) |
-| `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language |
+| `CALL_ME_INTRO`, `CALL_ME_REPLY_PROMPT`, `CALL_ME_ACK` | | Override phrases for the default language. By default there is no reply prompt: the call just listens after the message |
 | `CALL_ME_SPEECH_TIMEOUT` | | Seconds of silence that end your turn when speaking (default 3) |
 | `CALL_ME_BARGE_IN` | | `1` lets you interrupt Claude's line in live calls by talking, but noise can also cut it off (default off) |
 | `CALL_ME_RETRIES` | | Extra attempts when you don't pick up (default 4) |
