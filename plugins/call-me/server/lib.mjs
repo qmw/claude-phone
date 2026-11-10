@@ -223,10 +223,14 @@ export function offlineUrl(p) {
 /** E.164 comparison tolerant of spaces/dashes. */
 export const samePhone = (a, b) => !!a && !!b && a.replace(/[^\d+]/g, "") === b.replace(/[^\d+]/g, "");
 
-/** Inbound callers allowed to talk to the session: CALL_ME_TO_NUMBER plus CALL_ME_ALLOWED_CALLERS (comma-separated). */
+const list = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
+
+/** The phones Claude calls, in order: CALL_ME_TO_NUMBER, then CALL_ME_BACKUP_NUMBERS when it isn't answered. */
+export const callTargets = (cfg) => [...new Set([cfg.CALL_ME_TO_NUMBER, ...list(cfg.CALL_ME_BACKUP_NUMBERS)].filter(Boolean))];
+
+/** Inbound callers allowed to talk to the session: the phones it calls plus CALL_ME_ALLOWED_CALLERS (comma-separated). */
 export function allowedCaller(cfg, from) {
-  const allowed = [cfg.CALL_ME_TO_NUMBER, ...(cfg.CALL_ME_ALLOWED_CALLERS || "").split(",")];
-  return allowed.some((n) => samePhone(from, n.trim()));
+  return [...callTargets(cfg), ...list(cfg.CALL_ME_ALLOWED_CALLERS)].some((n) => samePhone(from, n));
 }
 
 /** Name of this machine, reported with inbound calls so the session knows which number was dialled. */

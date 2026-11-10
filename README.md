@@ -58,7 +58,7 @@ Every session follows these rules, because the plugin enforces them rather than 
 | What happens | Twilio sees | Rule |
 | --- | --- | --- |
 | You answer | `completed`, answered by a human | Deliver the message and return your reply. |
-| You don't pick up, or you're on another call | `no-answer` after 30 s of ringing, or `busy` | Retry every 90 s, up to 4 more times (`CALL_ME_RETRIES`, `CALL_ME_RETRY_DELAY`). If none succeed, save the message for your callback. |
+| You don't pick up, or you're on another call | `no-answer` after 30 s of ringing, or `busy` | Ring your backup phones (`CALL_ME_BACKUP_NUMBERS`) one after another. If nobody answers, try the whole list again every 90 s, up to 4 more times (`CALL_ME_RETRIES`, `CALL_ME_RETRY_DELAY`). If none succeed, save the message for your callback. |
 | You **reject** the call | Your carrier sends rejected calls straight to voicemail, so Twilio sees a call answered by a machine (answering machine detection) | Hang up without leaving a voicemail and **don't retry**. Save the message and start **do-not-disturb**: further `call_me` calls from any session only save their messages, until you call back or `CALL_ME_DND_MINUTES` (120) pass. |
 | You pick up and hang up at once (detection off) | `completed`, under 3 s | Reported as "probably didn't hear it". |
 
@@ -110,6 +110,7 @@ Every session can have its own Twilio number, so you can call the session you wa
 | --- | --- |
 | `from_number` | The session's own Twilio number. Its calls come from this number, and dialling it reaches this session. It must be on your Twilio account. |
 | `to_number` | The phone the session calls. It is also allowed to call in. |
+| `backup_numbers` | Phones called next, in order, when `to_number` doesn't pick up or is busy. They may call in too. |
 | `allowed_callers` | Other phones allowed to call the session. |
 | `language`, `answer_calls` | The session's default call language, and whether it answers its number. |
 
@@ -143,6 +144,7 @@ $env:CALL_ME_INBOUND = "1"; claude --dangerously-load-development-channels plugi
 | `TWILIO_AUTH_TOKEN` | ✓ | |
 | `TWILIO_FROM_NUMBER` | ✓ | Your Twilio number, E.164 format |
 | `CALL_ME_TO_NUMBER` | ✓ | Your phone, E.164 format. Claude calls it, and it may call in |
+| `CALL_ME_BACKUP_NUMBERS` | | Backup phones, comma-separated E.164, called in this order when `CALL_ME_TO_NUMBER` doesn't pick up |
 | `CALL_ME_ALLOWED_CALLERS` | | More phones that may call in, comma-separated E.164 |
 | `CALL_ME_MACHINE` | | Name of this machine, reported with inbound calls (default: hostname) |
 | `CALL_ME_LANGUAGE` | | Default language: `en-US` (default) or `pl-PL`. Sets the voice, phrases and speech recognition |

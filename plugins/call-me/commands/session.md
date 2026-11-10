@@ -9,7 +9,8 @@ Configure call-me for this session with the `call_me_settings` tool.
 2. If the user said what to change ($ARGUMENTS), apply exactly that. Otherwise ask what they want:
    - `from_number`: this session's own Twilio number. Calls come from it, and the user dials it to reach this session. Pick a number no other session is answering.
    - `to_number`: the phone this session calls.
-   - `allowed_callers`: other phones allowed to call this session (to_number always is).
+   - `backup_numbers`: phones tried next, in order, when to_number doesn't pick up.
+   - `allowed_callers`: other phones allowed to call this session (to_number and backup_numbers always are).
    - `language`, `answer_calls`.
    Settings are saved for this project directory by default. Use `scope: "session"` only if the user wants a temporary change.
 3. Show the result. If it says the session can't receive calls, tell the user to restart it with the `claude-phone` launcher (`claude-phone --resume <session-id>`).

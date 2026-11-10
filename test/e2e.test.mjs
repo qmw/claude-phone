@@ -350,3 +350,27 @@ test("by default saved messages are not read on the phone, only handed to the se
     s.proc.kill();
   }
 });
+
+test("backup phones are tried in order when the main one doesn't pick up, and may call in", async () => {
+  const s = startServer({
+    FAKE_CALLS: "no-answer;completed:human:12",
+    CALL_ME_BACKUP_NUMBERS: "+48500000007,+48500000008",
+    CALL_ME_ALLOWED_CALLERS: "",
+  });
+  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Done.", wait_for_reply: false } } });
+    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
+    assert.deepEqual(created().map((r) => r.form.To), [ME, "+48500000007"]);
+    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /delivered\. \(call CA2, to \+48500000007, a backup phone\)/);
+
+    // Backups may call in; strangers may not.
+    assert.doesNotMatch((await webhook("/incoming", { From: "+48500000008", CallSid: "CAb" })).body, /<Reject/);
+    assert.match((await webhook("/incoming", { From: "+48500000009", CallSid: "CAx" })).body, /<Reject/);
+  } finally {
+    s.proc.kill();
+  }
+});

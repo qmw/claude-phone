@@ -25,6 +25,7 @@ import {
   buildLiveTurnTwiml,
   offlineUrl,
   allowedCaller,
+  callTargets,
   machineName,
   REJECT_TWIML,
   validSignature,
@@ -36,7 +37,7 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.6.4";
+const VERSION = "0.7.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -381,8 +382,8 @@ const RESULT = {
     "The user REJECTED the call (it went to their voicemail; nothing was left there). Do NOT call again. " +
     "The message was saved and is passed on when the user calls back; until then further call_me calls only save messages. " +
     "Carry on without their answer if you can, otherwise wait for them.",
-  exhausted: (n) =>
-    `The user did not pick up after ${n} attempt(s) (probably busy or away). The message was saved and is passed on when they call back. ` +
+  exhausted: (n, phones = 1) =>
+    `The user did not pick up after ${n} attempt(s)${phones > 1 ? ` on each of their ${phones} phones` : ""} (probably busy or away). The message was saved and is passed on when they call back. ` +
     "Do not keep calling; carry on without their answer if you can.",
   dnd: "Not called: the user rejected an earlier call and has not called back yet. The message was saved and is passed on when they call back.",
   short: "The user picked up and hung up immediately; they probably did not hear the message.",
@@ -391,7 +392,7 @@ const RESULT = {
 };
 
 /** One outbound call attempt. Returns { outcome, reply, sid }. */
-async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds, stayOnLine = false) {
+async function placeCall(cfg, to, profile, message, wait_for_reply, timeout_seconds, stayOnLine = false) {
   const callId = crypto.randomBytes(16).toString("hex");
   let gatherUrl = null;
   let replyPromise = new Promise(() => {});
@@ -420,7 +421,7 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds,
         }
       : { MachineDetection: "Enable", MachineDetectionTimeout: "8" };
   const call = await twilio(cfg, "POST", "Calls.json", {
-    To: cfg.CALL_ME_TO_NUMBER,
+    To: to,
     From: cfg.TWILIO_FROM_NUMBER,
     Twiml: buildCallTwiml(message, profile, gatherUrl),
     Timeout: "30",
@@ -473,16 +474,21 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
 
   const maxRetries = Math.max(0, Number(retries ?? cfg.CALL_ME_RETRIES ?? 4));
   const delay = Number(cfg.CALL_ME_RETRY_DELAY ?? 90) * 1000;
-  let r;
-  for (let attempt = 0; ; attempt++) {
-    r = await placeCall(cfg, profile, message, wait_for_reply || stay_on_line, timeout_seconds, stay_on_line);
-    log(`attempt ${attempt + 1}: ${r.outcome}`);
-    if (!RETRYABLE.has(r.outcome) || attempt >= maxRetries) break;
+  // Each round rings the main phone, then each backup right away while nobody picks up; a rejection stops it all.
+  const targets = callTargets(cfg);
+  let r, to;
+  rounds: for (let attempt = 0; ; attempt++) {
+    for (to of targets) {
+      r = await placeCall(cfg, to, profile, message, wait_for_reply || stay_on_line, timeout_seconds, stay_on_line);
+      log(`round ${attempt + 1}, ${to}: ${r.outcome}`);
+      if (!RETRYABLE.has(r.outcome)) break rounds;
+    }
+    if (attempt >= maxRetries) break;
     await sleep(delay);
     if (dndActive()) break; // rejected another session's call meanwhile
   }
 
-  const tag = ` (call ${r.sid})`;
+  const tag = ` (call ${r.sid}` + (targets.length > 1 ? `, to ${to}${to === targets[0] ? "" : ", a backup phone"})` : ")");
   switch (r.outcome) {
     case "answered": {
       const onLine = live.has(r.sid)
@@ -499,7 +505,7 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
     case "no-answer":
     case "busy":
       saveForCallback(entry);
-      return RESULT.exhausted(maxRetries + 1) + tag;
+      return RESULT.exhausted(maxRetries + 1, targets.length) + tag;
     case "timed-out":
       return `No reply within ${timeout_seconds}s; call was ended.${tag}`;
     default:
@@ -561,6 +567,7 @@ function numberOwner(n) {
 const SETTING_KEYS = {
   from_number: "TWILIO_FROM_NUMBER",
   to_number: "CALL_ME_TO_NUMBER",
+  backup_numbers: "CALL_ME_BACKUP_NUMBERS",
   allowed_callers: "CALL_ME_ALLOWED_CALLERS",
   language: "CALL_ME_LANGUAGE",
   answer_calls: "CALL_ME_ANSWER",
@@ -574,7 +581,7 @@ async function settings({ scope = "project", list_numbers = false, ...args }) {
     const v = args[arg];
     if (v === undefined || v === null) continue;
     if (v === "") values[key] = "";
-    else if (arg === "allowed_callers")
+    else if (arg === "allowed_callers" || arg === "backup_numbers")
       values[key] = (Array.isArray(v) ? v : String(v).split(",")).map((x) => String(x).trim()).filter(Boolean).map(e164).join(",");
     else if (arg === "language") values[key] = normalizeLanguage(v);
     else if (arg === "answer_calls") values[key] = v === true || /^(1|true|yes)$/i.test(String(v)) ? "1" : "0";
@@ -619,7 +626,8 @@ async function settings({ scope = "project", list_numbers = false, ...args }) {
     `call-me settings for this session (${scope === "project" ? `saved for this project in ${PROJECT_FILE}` : "this session only"}):\n` +
     `- from_number (this session's Twilio number; calls come from it and you dial it to reach this session): ${shown("TWILIO_FROM_NUMBER")}\n` +
     `- to_number (the phone this session calls): ${shown("CALL_ME_TO_NUMBER")}\n` +
-    `- allowed_callers (may call this session, besides to_number): ${cfg.CALL_ME_ALLOWED_CALLERS || "(none)"}\n` +
+    `- backup_numbers (called in this order when to_number doesn't pick up): ${cfg.CALL_ME_BACKUP_NUMBERS || "(none)"}\n` +
+    `- allowed_callers (may call this session, besides the phones above): ${cfg.CALL_ME_ALLOWED_CALLERS || "(none)"}\n` +
     `- language: ${cfg.CALL_ME_LANGUAGE || "en-US"}\n` +
     `- answer_calls: ${ownedNumber ? `yes, answering ${ownedNumber.phone}` : answering(cfg) ? "yes, but not answering yet" : "no"}`;
   if (notes.length) out += "\n\n" + notes.join("\n");
@@ -685,7 +693,7 @@ const TOOLS = [
   {
     name: "call_me_settings",
     description:
-      "Show or change this session's phone numbers: which Twilio number it calls from and answers (from_number), which phone it calls (to_number), " +
+      "Show or change this session's phone numbers: which Twilio number it calls from and answers (from_number), which phone it calls (to_number) and which backup phones it tries next (backup_numbers), " +
       "which other phones may call it (allowed_callers), its language, and whether it answers calls (answer_calls). " +
       "With no arguments it just shows the current settings. Changes are saved for this project directory (scope project, the default) " +
       "or kept for this session only (scope session). Pass an empty string to reset a value to the machine default. " +
@@ -695,10 +703,15 @@ const TOOLS = [
       properties: {
         from_number: { type: "string", description: "This session's Twilio number (E.164). Must be on the Twilio account." },
         to_number: { type: "string", description: "The phone this session calls (E.164)." },
+        backup_numbers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Phones to try, in this order, when to_number doesn't pick up (E.164). They may also call in. [] clears the list.",
+        },
         allowed_callers: {
           type: "array",
           items: { type: "string" },
-          description: "Other phones allowed to call this session (E.164). to_number is always allowed. [] clears the list.",
+          description: "Other phones allowed to call this session (E.164). to_number and backup_numbers are always allowed. [] clears the list.",
         },
         language: { type: "string", enum: ["en-US", "pl-PL", ""], description: "Default language for this session's calls." },
         answer_calls: { type: "boolean", description: "Answer calls to from_number (needs a session started with claude-phone)." },
