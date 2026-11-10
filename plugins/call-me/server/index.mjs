@@ -36,7 +36,7 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -146,8 +146,11 @@ async function startServer(initial) {
     const url = new URL(req.url, "http://x");
     if (url.pathname === "/health") return res.end("ok");
     const outbound = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
+    const amdRoute = url.pathname.match(/^\/amd\/([a-f0-9]{32})$/);
     const liveRoute = url.pathname.match(/^\/live\/(wait|gather)$/);
-    const known = (outbound && pending.has(outbound[1])) || liveRoute || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
+    const known =
+      (outbound && pending.has(outbound[1])) ||
+      (amdRoute && pending.has(amdRoute[1])) || liveRoute || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
     if (req.method !== "POST" || !known) {
       res.statusCode = 404;
       return res.end();
@@ -160,6 +163,12 @@ async function startServer(initial) {
       return res.end();
     }
     res.setHeader("Content-Type", "text/xml");
+
+    if (amdRoute) {
+      // Async answering machine detection: the message is already playing; the call loop hangs up on a machine.
+      pending.get(amdRoute[1]).answeredBy = params.AnsweredBy || "unknown";
+      return res.end();
+    }
 
     if (liveRoute) {
       const e = live.get(params.CallSid);
@@ -228,20 +237,22 @@ async function startServer(initial) {
   return server.address().port;
 }
 
+const CLOUDFLARED_FILE = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+
 function cloudflaredBinary() {
   try {
     execFileSync("cloudflared", ["--version"], { stdio: "ignore" });
     return "cloudflared";
   } catch {}
   const dir = path.join(os.homedir(), ".cache", "claude-call-me");
-  const bin = path.join(dir, "cloudflared");
+  const bin = path.join(dir, CLOUDFLARED_FILE);
   return fs.existsSync(bin) ? bin : null;
 }
 
 async function downloadCloudflared() {
   const arch = { x64: "amd64", arm64: "arm64" }[process.arch];
   const dir = path.join(os.homedir(), ".cache", "claude-call-me");
-  const bin = path.join(dir, "cloudflared");
+  const bin = path.join(dir, CLOUDFLARED_FILE);
   fs.mkdirSync(dir, { recursive: true });
   const base = "https://github.com/cloudflare/cloudflared/releases/latest/download/";
   if (process.platform === "linux" && arch) {
@@ -249,6 +260,11 @@ async function downloadCloudflared() {
     const res = await fetch(base + `cloudflared-linux-${arch}`);
     if (!res.ok) throw new Error(`cloudflared download failed: HTTP ${res.status}`);
     fs.writeFileSync(bin, Buffer.from(await res.arrayBuffer()), { mode: 0o755 });
+  } else if (process.platform === "win32" && arch === "amd64") {
+    log("downloading cloudflared…");
+    const res = await fetch(base + "cloudflared-windows-amd64.exe");
+    if (!res.ok) throw new Error(`cloudflared download failed: HTTP ${res.status}`);
+    fs.writeFileSync(bin, Buffer.from(await res.arrayBuffer()));
   } else if (process.platform === "darwin" && arch) {
     log("downloading cloudflared…");
     const res = await fetch(base + `cloudflared-darwin-${arch}.tgz`);
@@ -370,19 +386,36 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds,
   const callId = crypto.randomBytes(16).toString("hex");
   let gatherUrl = null;
   let replyPromise = new Promise(() => {});
+  let entry = null;
   if (wait_for_reply) {
     const { publicUrl } = await ensureWebhook(cfg);
     gatherUrl = `${publicUrl}/gather/${callId}`;
-    replyPromise = new Promise((resolve) => pending.set(callId, { resolve, profile, stayOnLine }));
+    replyPromise = new Promise((resolve) => {
+      entry = { resolve, profile, stayOnLine, answeredBy: null };
+      pending.set(callId, entry);
+    });
   }
 
   const amd = cfg.CALL_ME_AMD !== "0";
+  // With a webhook, detection runs in the background (AsyncAmd) so the message starts as soon as the user
+  // picks up; synchronous detection made them wait in silence for a few seconds first.
+  const amdParams = !amd
+    ? {}
+    : entry
+      ? {
+          MachineDetection: "Enable",
+          MachineDetectionTimeout: "8",
+          AsyncAmd: "true",
+          AsyncAmdStatusCallback: `${webhook.publicUrl}/amd/${callId}`,
+          AsyncAmdStatusCallbackMethod: "POST",
+        }
+      : { MachineDetection: "Enable", MachineDetectionTimeout: "8" };
   const call = await twilio(cfg, "POST", "Calls.json", {
     To: cfg.CALL_ME_TO_NUMBER,
     From: cfg.TWILIO_FROM_NUMBER,
     Twiml: buildCallTwiml(message, profile, gatherUrl),
     Timeout: "30",
-    ...(amd ? { MachineDetection: "Enable", MachineDetectionTimeout: "8" } : {}),
+    ...amdParams,
   });
   log(`placed call ${call.sid}`);
 
@@ -396,7 +429,7 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds,
       if (reply) break;
       c = await twilio(cfg, "GET", `Calls/${call.sid}.json`);
       // Voicemail picked up (= the user rejected the call): hang up before leaving a message.
-      if (/^(machine|fax)/.test(c.answered_by || "") && !TERMINAL_STATUSES.has(c.status)) {
+      if (/^(machine|fax)/.test(entry?.answeredBy || c.answered_by || "") && !TERMINAL_STATUSES.has(c.status)) {
         await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
         c = { ...c, status: "completed" };
         break;
@@ -411,7 +444,7 @@ async function placeCall(cfg, profile, message, wait_for_reply, timeout_seconds,
     await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
     return { outcome: "timed-out", sid: call.sid };
   }
-  const outcome = classifyOutcome({ status: c.status, answeredBy: amd ? c.answered_by || "unknown" : null, duration: c.duration });
+  const outcome = classifyOutcome({ status: c.status, answeredBy: amd ? entry?.answeredBy || c.answered_by || "unknown" : null, duration: c.duration });
   return { outcome, sid: call.sid };
 }
 

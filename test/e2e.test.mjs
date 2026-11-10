@@ -295,3 +295,30 @@ test("call_me_settings: each session/project picks its own numbers and answers i
     s.proc.kill();
   }
 });
+
+test("calls that wait for a reply detect voicemail in the background and hang up on it", async () => {
+  const s = startServer();
+  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+
+    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Hej.", retries: 0 } } });
+    await s.until(() => created().length === 1);
+    const form = created()[0].form;
+    assert.equal(form.MachineDetection, "Enable");
+    assert.equal(form.AsyncAmd, "true");
+    const amdPath = form.AsyncAmdStatusCallback.slice(BASE.length);
+    assert.match(amdPath, /^\/amd\/[a-f0-9]{32}$/);
+
+    // Unsigned callbacks are refused; a signed "machine" verdict hangs up and counts as a rejection.
+    assert.equal((await webhook(amdPath, { CallSid: "CA1", AnsweredBy: "machine_start" }, { sign: false })).status, 403);
+    assert.equal((await webhook(amdPath, { CallSid: "CA1", AnsweredBy: "machine_start" })).status, 200);
+    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
+    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /REJECTED/);
+    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA1.json") && r.form.Status === "completed"));
+  } finally {
+    s.proc.kill();
+  }
+});

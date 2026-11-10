@@ -125,6 +125,16 @@ The same works across machines. Install the plugin on each machine, run `/call-m
 
 **Cost tip:** Twilio numbers in your own country make calling Claude a domestic call. A Polish geographic number is about $3 a month, and calls to it fall under unlimited domestic minutes. Calling a US number from Poland is billed as international. Polish numbers need a Twilio regulatory bundle: an ID, plus an address in the area of the number's prefix.
 
+## Windows
+
+The plugin runs on Windows with Node 18 or newer, in the Claude Code CLI or in the Code tab of the Claude Desktop app. Install it the same way. On the first call that waits for a reply it downloads `cloudflared.exe` to `%USERPROFILE%\.cache\claude-call-me\`. Alternatively, install it yourself with `winget install Cloudflare.cloudflared`. The config file is `%USERPROFILE%\.config\claude-call-me\config.env`.
+
+Calling Claude needs the `--dangerously-load-development-channels` flag, so it works only in the CLI. The Desktop app can't pass the flag, but it can still call you. A PowerShell version of the launcher:
+
+```powershell
+$env:CALL_ME_INBOUND = "1"; claude --dangerously-load-development-channels plugin:call-me@claude-phone @args
+```
+
 ## Config
 
 | Key | Required | Notes |
@@ -143,7 +153,7 @@ The same works across machines. Install the plugin on each machine, run `/call-m
 | `CALL_ME_RETRIES` | | Extra attempts when you don't pick up (default 4) |
 | `CALL_ME_RETRY_DELAY` | | Seconds between attempts (default 90) |
 | `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |
-| `CALL_ME_AMD` | | `0` turns off answering machine detection, which costs about $0.0075 per call. Rejections then can't be detected. |
+| `CALL_ME_AMD` | | `0` turns off answering machine detection, which costs about $0.0075 per call. Rejections then can't be detected. When Claude waits for your reply, detection runs while the message plays, so it starts as soon as you pick up |
 | `CALL_ME_STATE_DIR` | | Where saved messages are kept (default `~/.local/state/claude-call-me`) |
 | `CALL_ME_LIVE` | | `0` = inbound calls hang up after you speak instead of staying open (default on) |
 | `CALL_ME_LIVE_HOLD` | | Seconds you are kept on hold waiting for Claude's next line (default 120) |
