@@ -185,7 +185,7 @@ export function buildSayHangupTwiml(p, text) {
  * then record what they say. With saved messages, an empty reply is still posted so the session learns
  * they were heard.
  */
-export function buildInboundTwiml(p, gatherUrl, saved = []) {
+export function buildInboundTwiml(p, gatherUrl, saved = [], postEmpty = saved.length > 0) {
   let x = `${XML}<Response>`;
   if (saved.length) {
     x += say(p, p.savedIntro(saved.length));
@@ -194,7 +194,7 @@ export function buildInboundTwiml(p, gatherUrl, saved = []) {
       x += say(mp, `${mp.savedFrom(m.project)} ${m.message}`) + `<Pause length="1"/>`;
     }
   }
-  x += gather(p, gatherUrl, say(p, p.inboundGreeting), "speech", saved.length > 0);
+  x += gather(p, gatherUrl, say(p, p.inboundGreeting), "speech", postEmpty);
   return x + say(p, p.inboundEmpty) + `</Response>`;
 }
 

@@ -92,7 +92,7 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
     assert.equal(ev.content, "Odpal testy");
     assert.deepEqual(ev.meta, {
-      live: "true", from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages_heard: "0",
+      live: "true", from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages: "0", saved_messages_heard: "0",
     });
 
     // A second phone on the allow-list gets through too.
@@ -127,7 +127,11 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
 });
 
 test("retries unanswered calls, stops on rejection, holds calls until the user calls back", async () => {
-  const s = startServer({ FAKE_CALLS: "no-answer;in-progress:machine_start;completed:human:12", CALL_ME_RETRY_DELAY: "0.1" });
+  const s = startServer({
+    FAKE_CALLS: "no-answer;in-progress:machine_start;completed:human:12",
+    CALL_ME_RETRY_DELAY: "0.1",
+    CALL_ME_READ_SAVED: "1",
+  });
   const result = async (id) => {
     await s.until(() => s.stdout.some((m) => m.id === id), 15000);
     return s.stdout.find((m) => m.id === id).result.content[0].text;
@@ -318,6 +322,30 @@ test("calls that wait for a reply detect voicemail in the background and hang up
     await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
     assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /REJECTED/);
     assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA1.json") && r.form.Status === "completed"));
+  } finally {
+    s.proc.kill();
+  }
+});
+
+test("by default saved messages are not read on the phone, only handed to the session", async () => {
+  const s = startServer({ FAKE_CALLS: "in-progress:machine_start" });
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Build failed.", wait_for_reply: false } } });
+    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
+    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /REJECTED/);
+
+    const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
+    assert.doesNotMatch(answer.body, /Zapisane|Build failed/);
+    assert.match(answer.body, /actionOnEmptyResult="true"/);
+    await webhook("/incoming/gather", { From: ME, CallSid: "CAin" });
+    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
+    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
+    assert.match(ev.content, /^\(the user said nothing\)\n\nSaved messages [^\n]*NOT heard[\s\S]*Build failed\./);
+    assert.equal(ev.meta.saved_messages, "1");
+    assert.equal(ev.meta.saved_messages_heard, "0");
   } finally {
     s.proc.kill();
   }

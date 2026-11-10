@@ -36,7 +36,7 @@ import {
   dndActive,
 } from "./lib.mjs";
 
-const VERSION = "0.6.3";
+const VERSION = "0.6.4";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -69,7 +69,7 @@ async function twilio(cfg, method, resource, form) {
 // ---------------------------------------------------- webhook server + tunnel
 
 const pending = new Map(); // callId -> { resolve, profile }
-const heardSaved = new Map(); // inbound CallSid -> saved messages read to the user on that call
+const heardSaved = new Map(); // inbound CallSid -> saved messages handed to the session after that call
 let webhook = null; // { port, publicUrl }
 
 // Live calls: the user stays on the line while Claude works out its next line (phone_reply).
@@ -197,20 +197,28 @@ async function startServer(initial) {
       return res.end(REJECT_TWIML);
     }
     if (url.pathname === "/incoming") {
-      // The user calling in is also "calling back": read saved messages and end do-not-disturb.
+      // The user calling in is also "calling back": it ends do-not-disturb and hands the saved messages to this
+      // session. They are read aloud first only with CALL_ME_READ_SAVED=1.
       const saved = takeSaved();
       if (saved.length) heardSaved.set(params.CallSid, saved);
-      return res.end(buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`, saved));
+      const readAloud = cfg.CALL_ME_READ_SAVED === "1";
+      return res.end(
+        buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`, readAloud ? saved : [], saved.length > 0),
+      );
     }
     const saved = heardSaved.get(params.CallSid) || [];
     heardSaved.delete(params.CallSid);
     if (params.SpeechResult || saved.length) {
       log(`inbound message from ${params.From}`);
-      let content = params.SpeechResult || "(the user said nothing after hearing the saved messages)";
+      const readAloud = cfg.CALL_ME_READ_SAVED === "1";
+      let content = params.SpeechResult || "(the user said nothing)";
       if (saved.length)
         content +=
-          "\n\nBefore speaking, the user heard these saved messages from earlier unanswered calls " +
-          "(route any answer to the session working in that project):\n" +
+          (readAloud
+            ? "\n\nBefore speaking, the user heard these saved messages from earlier unanswered calls " +
+              "(route any answer to the session working in that project):\n"
+            : "\n\nSaved messages from earlier unanswered calls. The user has NOT heard them: do not read them out on the call " +
+              "unless asked; list them on screen (project and gist) and pass them to the sessions working in those projects:\n") +
           saved.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n");
       const liveCall = !NO.test(cfg.CALL_ME_LIVE || "") && !!params.SpeechResult;
       if (liveCall) startLive(params.CallSid, profile);
@@ -224,7 +232,8 @@ async function startServer(initial) {
           language: profile.language,
           confidence: params.Confidence ? Number(params.Confidence).toFixed(2) : "unknown",
           call_sid: params.CallSid,
-          saved_messages_heard: String(saved.length),
+          saved_messages: String(saved.length),
+          saved_messages_heard: String(readAloud ? saved.length : 0),
         },
       });
       if (liveCall) return res.end(buildHoldTwiml(profile, `${webhook.publicUrl}/live/wait`, null));
@@ -370,12 +379,12 @@ process.on("exit", () => tunnelProc?.kill());
 const RESULT = {
   rejected:
     "The user REJECTED the call (it went to their voicemail; nothing was left there). Do NOT call again. " +
-    "The message was saved and will be read to the user when they call back; until then further call_me calls only save messages. " +
+    "The message was saved and is passed on when the user calls back; until then further call_me calls only save messages. " +
     "Carry on without their answer if you can, otherwise wait for them.",
   exhausted: (n) =>
-    `The user did not pick up after ${n} attempt(s) (probably busy or away). The message was saved and will be read to them when they call back. ` +
+    `The user did not pick up after ${n} attempt(s) (probably busy or away). The message was saved and is passed on when they call back. ` +
     "Do not keep calling; carry on without their answer if you can.",
-  dnd: "Not called: the user rejected an earlier call and has not called back yet. The message was saved and will be read to them when they call back.",
+  dnd: "Not called: the user rejected an earlier call and has not called back yet. The message was saved and is passed on when they call back.",
   short: "The user picked up and hung up immediately; they probably did not hear the message.",
   failed: "Call failed.",
   canceled: "Call was canceled.",
@@ -633,7 +642,7 @@ const TOOLS = [
       "Write the message in the call's language. " +
       "Rules (enforced by the tool): an unanswered or busy call is retried automatically (default 4 more times, 90 s apart); " +
       "if the user rejects the call, it is not retried and later calls are held until the user calls back; " +
-      "undelivered messages are saved and read to the user when they call in. Never loop on this tool yourself.",
+      "undelivered messages are saved and passed on when the user calls in. Never loop on this tool yourself.",
     inputSchema: {
       type: "object",
       properties: {

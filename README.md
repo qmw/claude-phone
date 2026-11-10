@@ -62,7 +62,7 @@ Every session follows these rules, because the plugin enforces them rather than 
 | You **reject** the call | Your carrier sends rejected calls straight to voicemail, so Twilio sees a call answered by a machine (answering machine detection) | Hang up without leaving a voicemail and **don't retry**. Save the message and start **do-not-disturb**: further `call_me` calls from any session only save their messages, until you call back or `CALL_ME_DND_MINUTES` (120) pass. |
 | You pick up and hang up at once (detection off) | `completed`, under 3 s | Reported as "probably didn't hear it". |
 
-**Calling back** ends do-not-disturb. The `claude-phone` session first reads you every saved message, each in its own language and prefixed with its project, then listens as usual. The session receives what you said plus the list of messages you heard, so it can route your answer to the right project.
+**Calling back** ends do-not-disturb. The session you call gets every saved message along with what you said, shows them on screen, and can pass them on to the right projects. They aren't read on the phone. With `CALL_ME_READ_SAVED=1`, the session first reads them to you, each in its own language and prefixed with its project, then listens as usual.
 
 Saved messages and the do-not-disturb state live in `~/.local/state/claude-call-me/state.json`, shared by all sessions. Claude can pass `force: true` to override do-not-disturb, but only when you explicitly ask to be called now. `retries: 0` turns off retries for a single call.
 
@@ -154,6 +154,7 @@ $env:CALL_ME_INBOUND = "1"; claude --dangerously-load-development-channels plugi
 | `CALL_ME_RETRY_DELAY` | | Seconds between attempts (default 90) |
 | `CALL_ME_DND_MINUTES` | | How long a rejected call holds further calls if you don't call back (default 120) |
 | `CALL_ME_AMD` | | `0` turns off answering machine detection, which costs about $0.0075 per call. Rejections then can't be detected. When Claude waits for your reply, detection runs while the message plays, so it starts as soon as you pick up |
+| `CALL_ME_READ_SAVED` | | `1` = read saved messages aloud when you call in (default off: the session gets them as text) |
 | `CALL_ME_STATE_DIR` | | Where saved messages are kept (default `~/.local/state/claude-call-me`) |
 | `CALL_ME_LIVE` | | `0` = inbound calls hang up after you speak instead of staying open (default on) |
 | `CALL_ME_LIVE_HOLD` | | Seconds you are kept on hold waiting for Claude's next line (default 120) |
