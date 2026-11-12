@@ -17,8 +17,9 @@ export function relayTwiml({ url, language, greeting, cfg }) {
     welcomeGreeting: greeting,
     welcomeGreetingInterruptible: "speech",
     interruptible: "speech",
-    interruptSensitivity: cfg.CALL_ME_RELAY_INTERRUPT || "low",
-    ignoreBackchannel: "true",
+    // Tested 2026-11-12: "low" plus ignoreBackchannel let the caller say several things before the voice stopped.
+    interruptSensitivity: cfg.CALL_ME_RELAY_INTERRUPT || "high",
+    ignoreBackchannel: cfg.CALL_ME_RELAY_IGNORE_BACKCHANNEL === "1" ? "true" : "false",
     transcriptionProvider: "Deepgram",
     speechModel: "nova-3-general",
     hints: "Claude, AnyDesk, Twilio, GitHub, plugin",

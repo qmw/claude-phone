@@ -130,7 +130,7 @@ test("relay: TwiML asks for Polish, smart interruptions and our socket", async (
   const { relayTwiml } = await import("../plugins/call-me/server/relay.mjs");
   const x = relayTwiml({ url: "wss://h/relay/abc", language: "pl-PL", greeting: "Cześć & witaj", cfg: { CALL_ME_RELAY_VOICE: "pl-PL-Chirp3-HD-Aoede", CALL_ME_RELAY_TTS: "Google" } });
   assert.match(x, /<Connect><ConversationRelay url="wss:\/\/h\/relay\/abc" language="pl-PL" welcomeGreeting="Cześć &amp; witaj"/);
-  assert.match(x, /interruptSensitivity="low" ignoreBackchannel="true" transcriptionProvider="Deepgram" speechModel="nova-3-general"/);
+  assert.match(x, /interruptSensitivity="high" ignoreBackchannel="false" transcriptionProvider="Deepgram" speechModel="nova-3-general"/);
   assert.match(x, /ttsProvider="Google" voice="pl-PL-Chirp3-HD-Aoede"/);
   assert.doesNotMatch(relayTwiml({ url: "wss://h", language: "pl-PL", greeting: "x", cfg: {} }), /ttsProvider|voice=/);
 });
