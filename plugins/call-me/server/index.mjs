@@ -40,7 +40,7 @@ import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.9.1";
+const VERSION = "0.10.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -206,6 +206,22 @@ async function startServer(initial) {
       // The user calling in is also "calling back": it ends do-not-disturb and hands the saved messages to this
       // session. They are read aloud first only with CALL_ME_READ_SAVED=1.
       const saved = takeSaved();
+      if (cfg.CALL_ME_INBOUND_ENGINE === "relay") {
+        // Realtime: the call goes to ConversationRelay; each sentence reaches the session, phone_reply answers.
+        const token = crypto.randomBytes(16).toString("hex");
+        realtimePending.set(token, {
+          engine: "relay",
+          cfg,
+          language: profile.language,
+          opening: profile.inboundGreeting,
+          inbound: { from: params.From, to: params.To || cfg.TWILIO_FROM_NUMBER, machine: machineName(cfg), saved },
+        });
+        setTimeout(() => realtimePending.delete(token), 60000);
+        log(`inbound realtime call from ${params.From}`);
+        return res.end(
+          relayTwiml({ url: `${webhook.publicUrl.replace(/^http/, "ws")}/relay/${token}`, language: profile.language, greeting: profile.inboundGreeting, cfg }),
+        );
+      }
       if (saved.length) heardSaved.set(params.CallSid, saved);
       const readAloud = cfg.CALL_ME_READ_SAVED === "1";
       return res.end(
@@ -264,7 +280,7 @@ async function startServer(initial) {
       rt = new RealtimeCall({ ...p, notify, log, twilio, onEnd });
       rt.attachTwilio(tw);
     }
-    tw.once("message", () => setTimeout(() => rt.callSid && realtimeCalls.set(rt.callSid, rt), 0));
+    rt.onCallSid = (sid) => realtimeCalls.set(sid, rt);
     p.attached?.(rt);
   });
   const port = Number(initial.CALL_ME_PORT || 0);

@@ -41,6 +41,7 @@ function startServer(extraEnv = {}) {
   readline.createInterface({ input: proc.stdout }).on("line", (l) => (stdout.push(JSON.parse(l)), check()));
   readline.createInterface({ input: proc.stderr }).on("line", (l) => {
     if (l.startsWith("TWILIO ")) twilio.push(JSON.parse(l.slice(7)));
+    else if (process.env.E2E_DEBUG) console.error("SERVER", l);
     check();
   });
   const until = (pred, ms = 5000) =>
@@ -370,6 +371,42 @@ test("backup phones are tried in order when the main one doesn't pick up, and ma
     // Backups may call in; strangers may not.
     assert.doesNotMatch((await webhook("/incoming", { From: "+48500000008", CallSid: "CAb" })).body, /<Reject/);
     assert.match((await webhook("/incoming", { From: "+48500000009", CallSid: "CAx" })).body, /<Reject/);
+  } finally {
+    s.proc.kill();
+  }
+});
+
+test("incoming calls in realtime mode: ConversationRelay, sentences reach the session, phone_reply answers", async () => {
+  const { connect } = await import("../plugins/call-me/server/ws.mjs");
+  const s = startServer({ CALL_ME_INBOUND_ENGINE: "relay", CALL_ME_RELAY_TTS: "Amazon", CALL_ME_RELAY_VOICE: "Ola-Neural" });
+  try {
+    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    s.send({ method: "notifications/initialized" });
+    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+
+    assert.match((await webhook("/incoming", { From: "+48999999999", CallSid: "CAx" })).body, /<Reject/);
+    const twiml = (await webhook("/incoming", { From: ME, To: "+17250000000", CallSid: "CArt" })).body;
+    assert.match(twiml, /<ConversationRelay url="ws:\/\/127\.0\.0\.1:\d+\/relay\/[a-f0-9]{32}" language="pl-PL" welcomeGreeting="Cześć, tu Claude\. Słucham\."/);
+    assert.match(twiml, /ttsProvider="Amazon" voice="Ola-Neural"/);
+
+    const tw = await connect(twiml.match(/url="([^"]+)"/)[1]);
+    const said = [];
+    tw.on("message", (m) => said.push(JSON.parse(m)));
+    tw.send({ type: "setup", callSid: "CArt", from: ME });
+    tw.send({ type: "prompt", voicePrompt: "Sprawdź status builda", last: true });
+    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
+    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
+    assert.match(ev.content, /^Sprawdź status builda/);
+    assert.equal(ev.meta.direction, "inbound");
+    assert.equal(ev.meta.from, ME);
+    assert.equal(ev.meta.realtime, "true");
+
+    s.send({ id: 2, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CArt", message: "Build przeszedł." } } });
+    await s.until(() => s.stdout.some((m) => m.id === 2));
+    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /^Said/);
+    for (let i = 0; i < 100 && !said.some((m) => m.token === "Build przeszedł."); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(said.some((m) => m.token === "Build przeszedł."), JSON.stringify(said));
+    tw.close();
   } finally {
     s.proc.kill();
   }

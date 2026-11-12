@@ -32,8 +32,8 @@ export function relayTwiml({ url, language, greeting, cfg }) {
 }
 
 export class RelayCall {
-  constructor({ cfg, language, opening, notify, log, twilio, onEnd }) {
-    Object.assign(this, { cfg, language, opening, notify, log, twilio, onEnd });
+  constructor({ cfg, language, opening, notify, log, twilio, onEnd, inbound = null }) {
+    Object.assign(this, { cfg, language, opening, notify, log, twilio, onEnd, inbound });
     this.fillers = FILLERS[language] || FILLERS["en-US"];
     this.callSid = null;
     this.ready = false;
@@ -53,6 +53,7 @@ export class RelayCall {
       }
       if (m.type === "setup") {
         this.callSid = m.callSid;
+        this.onCallSid?.(m.callSid);
         this.ready = true;
         this.log(`relay call ${m.callSid} connected`);
       } else if (m.type === "prompt" && m.last !== false && m.voicePrompt?.trim()) this.heard(m.voicePrompt.trim());
@@ -72,9 +73,26 @@ export class RelayCall {
       .slice(-8)
       .map((t) => `${t.who === "caller" ? "Caller" : "You"}: ${t.text}`)
       .join("\n");
+    let content = `${text}\n\nRecent conversation on this realtime call:\n${recent}`;
+    const saved = this.inbound?.saved || [];
+    if (saved.length && !this.savedSent) {
+      this.savedSent = true;
+      content +=
+        "\n\nSaved messages from earlier unanswered calls. The user has NOT heard them: do not read them out on the call " +
+        "unless asked; list them on screen (project and gist) and pass them to the sessions working in those projects:\n" +
+        saved.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n");
+    }
     this.notify("notifications/claude/channel", {
-      content: `${text}\n\nRecent conversation on this realtime call:\n${recent}`,
-      meta: { live: "true", realtime: "true", call_sid: this.callSid, language: this.language },
+      content,
+      meta: {
+        live: "true",
+        realtime: "true",
+        call_sid: this.callSid,
+        language: this.language,
+        ...(this.inbound
+          ? { direction: "inbound", from: this.inbound.from, to: this.inbound.to, machine: this.inbound.machine, saved_messages: String(saved.length) }
+          : {}),
+      },
     });
   }
 
@@ -131,9 +149,15 @@ export class RelayCall {
     this.ws?.close();
     this.log(`relay call ${this.callSid} ended: ${reason}`);
     const transcript = this.transcript.map((t) => `${t.who === "caller" ? "Caller" : "You"}: ${t.text}`).join("\n");
+    const unsent = !this.savedSent && this.inbound?.saved?.length ? this.inbound.saved : [];
     if (reason !== "Claude ended the call")
       this.notify("notifications/claude/channel", {
-        content: `The realtime call has ended (${reason}). Transcript:\n${transcript}`,
+        content:
+          `The realtime call has ended (${reason}). Transcript:\n${transcript}` +
+          (unsent.length
+            ? "\n\nSaved messages from earlier unanswered calls (not heard by the user; show them on screen and pass them on):\n" +
+              unsent.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n")
+            : ""),
         meta: { live: "false", realtime: "true", call_sid: this.callSid || "", language: this.language },
       });
     this.onEnd?.(this);

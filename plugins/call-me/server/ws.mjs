@@ -21,7 +21,11 @@ class Conn extends EventEmitter {
       this.parse();
     });
     socket.on("close", () => this.finish());
-    socket.on("error", (e) => (this.emit("error", e), this.finish()));
+    // A reset connection (caller hung up, network drop) must not crash the server: report it only if someone listens.
+    socket.on("error", (e) => {
+      if (this.listenerCount("error")) this.emit("error", e);
+      this.finish();
+    });
     if (this.buf.length) setImmediate(() => this.parse());
   }
 

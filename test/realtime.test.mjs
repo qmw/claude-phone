@@ -169,3 +169,18 @@ test("relay: the voice can change mid-call", async () => {
   assert.equal(out[1].token, "Tu głos Charon.");
   rc.end("test");
 });
+
+test("ws: a reset connection does not throw", async () => {
+  const server = http.createServer();
+  let srv;
+  server.on("upgrade", (req, socket, head) => (srv = acceptUpgrade(req, socket, head)));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const c = await connect(`ws://127.0.0.1:${server.address().port}/x`);
+  let closed = false;
+  c.on("close", () => (closed = true));
+  await until(() => srv);
+  srv.socket.destroy(new Error("boom"));
+  c.socket.destroy(new Error("reset"));
+  await until(() => closed);
+  server.close();
+});

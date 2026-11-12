@@ -57,6 +57,7 @@ export class RealtimeCall {
       if (m.event === "start") {
         this.streamSid = m.start.streamSid;
         this.callSid = m.start.callSid;
+        this.onCallSid?.(this.callSid);
         this.startVoice().catch((e) => this.end(`voice failed: ${e.message}`));
       } else if (m.event === "media" && this.ready && m.media?.payload) {
         this.ai.send({ type: "session.input_audio.append", audio: m.media.payload });
