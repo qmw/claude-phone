@@ -98,9 +98,14 @@ export class RelayCall {
   }
 
   /** Claude's line. Returns at once: the caller's next sentence comes as a new channel event. */
-  say(message, { endCall = false } = {}) {
+  say(message, { endCall = false, voice } = {}) {
     if (this.ended) return `The call has already ended (${this.ended}); nothing was said.`;
     this.waiting = null;
+    if (voice) {
+      // "Provider:VoiceId", e.g. "Google:pl-PL-Chirp3-HD-Charon", "Amazon:Ola-Neural", "ElevenLabs:<voice id>".
+      const [ttsProvider, id] = String(voice).includes(":") ? String(voice).split(/:(.*)/s) : [null, String(voice)];
+      this.ws.send({ type: "language", ttsLanguage: this.language, ...(ttsProvider ? { ttsProvider } : {}), voice: id });
+    }
     this.speak(message);
     if (endCall) {
       // Let the line play out (about 14 characters a second), then end the session and the call.
@@ -114,8 +119,9 @@ export class RelayCall {
   async hangup() {
     if (this.ended) return;
     this.ws.send({ type: "end", handoffData: JSON.stringify({ reason: "claude-ended" }) });
-    if (this.callSid) await this.twilio(this.cfg, "POST", `Calls/${this.callSid}.json`, { Status: "completed" }).catch(() => {});
-    this.end("Claude ended the call");
+    const sid = this.callSid;
+    this.end("Claude ended the call"); // before the socket closes, so it isn't reported as the caller hanging up
+    if (sid) await this.twilio(this.cfg, "POST", `Calls/${sid}.json`, { Status: "completed" }).catch(() => {});
   }
 
   end(reason) {

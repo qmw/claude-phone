@@ -40,7 +40,7 @@ import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.9.0";
+const VERSION = "0.9.1";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -597,11 +597,12 @@ async function callMeRealtime(cfg, { message, language, force, engine }) {
   return `Realtime call failed: ${rt?.ended || "the voice did not start within 75 s"}.`;
 }
 
-async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120, exact = false }) {
+async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120, exact = false, voice }) {
   const rt = realtimeCalls.get(call_sid);
   if (rt) {
     if (!message || !String(message).trim()) throw new Error("message is required");
-    return rt.say(message, { endCall: end_call, exact });
+    if (voice && !(rt instanceof RelayCall)) throw new Error("voice can only change on ConversationRelay calls");
+    return rt.say(message, { endCall: end_call, exact, voice });
   }
   const { cfg } = config();
   const e = live.get(call_sid);
@@ -790,6 +791,12 @@ const TOOLS = [
         exact: {
           type: "boolean",
           description: "Realtime calls: have the voice say the message word for word (warnings, refusals, numbers). Default: it may phrase it naturally.",
+        },
+        voice: {
+          type: "string",
+          description:
+            'ConversationRelay calls: switch the voice from this line on, as "Provider:VoiceId", e.g. "Google:pl-PL-Chirp3-HD-Charon", ' +
+            '"Google:pl-PL-Chirp3-HD-Aoede", "Amazon:Ola-Neural", "ElevenLabs:W0sqKm1Sfw1EzlCH14FQ" (the Polish default).',
         },
       },
       required: ["call_sid", "message"],

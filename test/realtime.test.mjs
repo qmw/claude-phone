@@ -157,3 +157,15 @@ test("relay: caller's sentence reaches Claude, filler while waiting, answer spok
   assert.deepEqual(rest[0].slice(1), ["POST", "Calls/CA9.json", { Status: "completed" }]);
   assert.equal(events.length, 1);
 });
+
+test("relay: the voice can change mid-call", async () => {
+  const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
+  const out = [];
+  const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
+  const rc = new RelayCall({ cfg: {}, language: "pl-PL", opening: "x", notify() {}, log() {} });
+  rc.attach(ws);
+  rc.say("Tu głos Charon.", { voice: "Google:pl-PL-Chirp3-HD-Charon" });
+  assert.deepEqual(out[0], { type: "language", ttsLanguage: "pl-PL", ttsProvider: "Google", voice: "pl-PL-Chirp3-HD-Charon" });
+  assert.equal(out[1].token, "Tu głos Charon.");
+  rc.end("test");
+});
