@@ -38,8 +38,9 @@ import {
 } from "./lib.mjs";
 import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
+import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.8.1";
+const VERSION = "0.9.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -248,14 +249,21 @@ async function startServer(initial) {
   });
   // Realtime calls: Twilio opens the call's media stream here, at a single-use random path.
   server.on("upgrade", (req, socket, head) => {
-    const token = new URL(req.url, "http://x").pathname.match(/^\/media\/([a-f0-9]{32})$/)?.[1];
+    const token = new URL(req.url, "http://x").pathname.match(/^\/(?:media|relay)\/([a-f0-9]{32})$/)?.[1];
     const p = token && realtimePending.get(token);
     if (!p) return socket.destroy();
     realtimePending.delete(token);
     const tw = acceptUpgrade(req, socket, head);
     if (!tw) return;
-    const rt = new RealtimeCall({ ...p, notify, log, twilio, onEnd: (c) => setTimeout(() => realtimeCalls.delete(c.callSid), 60000) });
-    rt.attachTwilio(tw);
+    const onEnd = (c) => setTimeout(() => realtimeCalls.delete(c.callSid), 60000);
+    let rt;
+    if (p.engine === "relay") {
+      rt = new RelayCall({ ...p, notify, log, twilio, onEnd });
+      rt.attach(tw);
+    } else {
+      rt = new RealtimeCall({ ...p, notify, log, twilio, onEnd });
+      rt.attachTwilio(tw);
+    }
     tw.once("message", () => setTimeout(() => rt.callSid && realtimeCalls.set(rt.callSid, rt), 0));
     p.attached?.(rt);
   });
@@ -475,12 +483,12 @@ async function placeCall(cfg, to, profile, message, wait_for_reply, timeout_seco
   return { outcome, sid: call.sid };
 }
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime = false }) {
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime = false, engine }) {
   const { cfg, missing } = config();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
-  if (realtime) return callMeRealtime(cfg, { message, language, force });
+  if (realtime) return callMeRealtime(cfg, { message, language, force, engine });
   const profile = speechProfile(cfg, language);
   const entry = { message, language: profile.language, project: path.basename(process.cwd()), cwd: process.cwd() };
   const dndMinutes = Number(cfg.CALL_ME_DND_MINUTES ?? 120);
@@ -536,27 +544,33 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
  * Experimental: a live call where OpenAI's gpt-live-1 does the talking and Claude answers hand-offs with phone_reply.
  * Returns once the call is connected (or failed); everything after that arrives as channel events.
  */
-async function callMeRealtime(cfg, { message, language, force }) {
+async function callMeRealtime(cfg, { message, language, force, engine }) {
+  engine = engine || cfg.CALL_ME_REALTIME_ENGINE || "openai";
+  if (!["openai", "relay"].includes(engine)) throw new Error('engine must be "openai" or "relay"');
   if (!INBOUND) throw new Error("Realtime calls need a session started with the claude-phone launcher (channels).");
-  if (!(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY))
-    throw new Error(`Realtime calls need OPENAI_API_KEY in ${CONFIG_PATH}.`);
+  if (engine === "openai" && !(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY))
+    throw new Error(`Realtime calls with the OpenAI voice need OPENAI_API_KEY in ${CONFIG_PATH}.`);
   if (!force && dndActive()) return RESULT.dnd;
   const profile = speechProfile(cfg, language);
   const { publicUrl } = await ensureWebhook(cfg);
   const token = crypto.randomBytes(16).toString("hex");
   let rt = null;
   realtimePending.set(token, {
+    engine,
     cfg,
     language: profile.language,
     opening: message,
     project: path.basename(process.cwd()),
     attached: (c) => (rt = c),
   });
-  const streamUrl = `${publicUrl.replace(/^http/, "ws")}/media/${token}`;
+  const wsBase = publicUrl.replace(/^http/, "ws");
   const call = await twilio(cfg, "POST", "Calls.json", {
     To: callTargets(cfg)[0],
     From: cfg.TWILIO_FROM_NUMBER,
-    Twiml: `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${streamUrl}"/></Connect></Response>`,
+    Twiml:
+      engine === "relay"
+        ? relayTwiml({ url: `${wsBase}/relay/${token}`, language: profile.language, greeting: message, cfg })
+        : `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wsBase}/media/${token}"/></Connect></Response>`,
     Timeout: "30",
   });
   log(`placed realtime call ${call.sid}`);
@@ -566,7 +580,7 @@ async function callMeRealtime(cfg, { message, language, force }) {
     if (rt?.ready) {
       realtimeCalls.set(call.sid, rt);
       return (
-        `Realtime call connected (call ${call.sid}). The voice (gpt-live-1) is talking with the user now. ` +
+        `Realtime call connected (call ${call.sid}, ${engine === "relay" ? "Twilio ConversationRelay voice" : "OpenAI gpt-live-1 voice"}). ` +
         'Whenever it hands something to you, a channel event with realtime="true" arrives: answer with phone_reply(call_sid, message). ' +
         "Answer quickly, send short progress updates during long work, and end with end_call: true."
       );
@@ -742,6 +756,13 @@ const TOOLS = [
           description:
             "Experimental: a fast realtime voice (OpenAI gpt-live-1) talks with the user and hands their requests to you as channel events; " +
             "answer each with phone_reply. Needs OPENAI_API_KEY and a claude-phone session. Use only when the user asks for a realtime call.",
+        },
+        engine: {
+          type: "string",
+          enum: ["openai", "relay"],
+          description:
+            'Realtime voice: "openai" (gpt-live-1, instant small talk, English accent in Polish) or "relay" (Twilio ConversationRelay: ' +
+            "natural Polish voice, every sentence goes to you). Default: CALL_ME_REALTIME_ENGINE or openai.",
         },
         language: {
           type: "string",

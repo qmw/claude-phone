@@ -113,7 +113,9 @@ It needs:
 
 The voice costs $0.05 a minute, plus Twilio's $0.0044 a minute for the audio stream, on top of the line. The call's audio also goes to OpenAI, not only to Twilio. Polish isn't on OpenAI's list of supported languages yet.
 
-`CALL_ME_REALTIME_VOICE` picks the voice (default `marin`), and `CALL_ME_OWNER_NAME` tells the voice whose assistant it is. Only Claude calling you works so far; calls you make to Claude still use the regular mode.
+**Natural Polish: ConversationRelay.** OpenAI's voice speaks Polish with an English accent. With `engine: "relay"`, or `CALL_ME_REALTIME_ENGINE=relay`, Twilio ConversationRelay does the talking instead: Deepgram recognises your speech and an ElevenLabs voice speaks natural Polish. It ignores short sounds like "mhm" and stops when you really talk. Every sentence you say goes to Claude. You hear "Jasne, chwileczkę" right away, then Claude's answer, and "Nadal nad tym pracuję" every 25 seconds while Claude works. It needs no OpenAI key, but you must accept Twilio's *Predictive and Generative AI/ML Features Addendum* (Console → Voice → Settings → Privacy & Security). It costs $0.07 a minute on top of the line. `CALL_ME_RELAY_TTS` and `CALL_ME_RELAY_VOICE` change the voice (for example `Google` and `pl-PL-Chirp3-HD-Aoede`), and `CALL_ME_RELAY_INTERRUPT` sets how easily you interrupt it (`low`, the default, `medium` or `high`).
+
+`CALL_ME_REALTIME_VOICE` picks the OpenAI voice (default `marin`), and `CALL_ME_OWNER_NAME` tells the voice whose assistant it is. Only Claude calling you works so far; calls you make to Claude still use the regular mode.
 
 ## A number per session
 

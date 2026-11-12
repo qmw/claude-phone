@@ -125,3 +125,35 @@ test("voice instructions keep the voice from inventing and from taking secrets",
   assert.match(t, /Never accept passwords, PINs/);
   assert.match(t, /never invent results/);
 });
+
+test("relay: TwiML asks for Polish, smart interruptions and our socket", async () => {
+  const { relayTwiml } = await import("../plugins/call-me/server/relay.mjs");
+  const x = relayTwiml({ url: "wss://h/relay/abc", language: "pl-PL", greeting: "Cześć & witaj", cfg: { CALL_ME_RELAY_VOICE: "pl-PL-Chirp3-HD-Aoede", CALL_ME_RELAY_TTS: "Google" } });
+  assert.match(x, /<Connect><ConversationRelay url="wss:\/\/h\/relay\/abc" language="pl-PL" welcomeGreeting="Cześć &amp; witaj"/);
+  assert.match(x, /interruptSensitivity="low" ignoreBackchannel="true" transcriptionProvider="Deepgram" speechModel="nova-3-general"/);
+  assert.match(x, /ttsProvider="Google" voice="pl-PL-Chirp3-HD-Aoede"/);
+  assert.doesNotMatch(relayTwiml({ url: "wss://h", language: "pl-PL", greeting: "x", cfg: {} }), /ttsProvider|voice=/);
+});
+
+test("relay: caller's sentence reaches Claude, filler while waiting, answer spoken, hang-up", async () => {
+  const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
+  const out = [], events = [], rest = [];
+  const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
+  const rc = new RelayCall({ cfg: {}, language: "pl-PL", opening: "Cześć", notify: (m, p) => events.push(p), log: () => {}, twilio: async (...a) => rest.push(a) });
+  rc.attach(ws);
+  ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA9" }));
+  assert.ok(rc.ready);
+  ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Jaka jest wersja", last: false }));
+  assert.equal(events.length, 0);
+  ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Jaka jest wersja pluginu?", last: true }));
+  assert.match(events[0].content, /^Jaka jest wersja pluginu\?/);
+  assert.equal(events[0].meta.call_sid, "CA9");
+  await until(() => out.length === 1, 3000); // filler after 1.5 s
+  assert.match(out[0].token, /chwileczkę|sprawdzam/i);
+  assert.match(rc.say("Wersja zero osiem."), /^Said/);
+  assert.deepEqual(out[1], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
+  await rc.hangup();
+  assert.equal(out[2].type, "end");
+  assert.deepEqual(rest[0].slice(1), ["POST", "Calls/CA9.json", { Status: "completed" }]);
+  assert.equal(events.length, 1);
+});
