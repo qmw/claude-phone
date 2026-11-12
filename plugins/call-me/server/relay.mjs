@@ -5,8 +5,8 @@
 import { xmlEscape } from "./lib.mjs";
 
 const FILLERS = {
-  "pl-PL": { first: ["Jasne, chwileczkę.", "Już sprawdzam.", "Moment, sprawdzam."], still: "Nadal nad tym pracuję." },
-  "en-US": { first: ["Sure, one moment.", "Checking now.", "Give me a second."], still: "Still working on it." },
+  "pl-PL": { first: ["Chwileczkę."], still: "Nadal nad tym pracuję." },
+  "en-US": { first: ["One moment."], still: "Still working on it." },
 };
 
 /** TwiML that connects the call to our WebSocket through ConversationRelay. */
@@ -97,14 +97,15 @@ export class RelayCall {
     });
   }
 
-  /** Keep the caller company while Claude works: a filler after 1.5 s, then "still on it" every 25 s. */
+  /** Keep the caller company while Claude works: a filler after 2.5 s (CALL_ME_RELAY_FILLER overrides it, "" turns it off), then "still on it" every 25 s. */
   tick() {
     const w = this.waiting;
     if (!w || this.ended) return;
     const now = Date.now();
-    if (!w.filled && now - w.since > 1500) {
+    if (!w.filled && now - w.since > 2500) {
       w.filled = true;
-      this.speak(this.fillers.first[Math.floor(Math.random() * this.fillers.first.length)], false);
+      const filler = this.cfg.CALL_ME_RELAY_FILLER ?? this.fillers.first[Math.floor(Math.random() * this.fillers.first.length)];
+      if (filler.trim()) this.speak(filler, false);
     } else if (now > w.stillAt) {
       w.stillAt = now + 25000;
       this.speak(this.fillers.still, false);

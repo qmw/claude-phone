@@ -148,8 +148,8 @@ test("relay: caller's sentence reaches Claude, filler while waiting, answer spok
   ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Jaka jest wersja pluginu?", last: true }));
   assert.match(events[0].content, /^Jaka jest wersja pluginu\?/);
   assert.equal(events[0].meta.call_sid, "CA9");
-  await until(() => out.length === 1, 3000); // filler after 1.5 s
-  assert.match(out[0].token, /chwileczkę|sprawdzam/i);
+  await until(() => out.length === 1, 4000); // filler after 2.5 s
+  assert.equal(out[0].token, "Chwileczkę.");
   assert.match(rc.say("Wersja zero osiem."), /^Said/);
   assert.deepEqual(out[1], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
   await rc.hangup();
