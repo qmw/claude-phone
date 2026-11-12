@@ -80,7 +80,7 @@ export class RealtimeCall {
           project: this.project,
           ownerName: this.cfg.CALL_ME_OWNER_NAME,
         }),
-        audio: { format: { type: "audio/pcmu" }, output: { voice: this.voice } },
+        audio: { format: { type: "audio/pcmu", rate: 8000 }, output: { voice: this.voice } },
         delegation: { type: "client" },
       },
     });

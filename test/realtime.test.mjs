@@ -68,7 +68,7 @@ test("realtime call: audio both ways, hand-off to Claude, answer spoken, hang-up
 
   const start = fromClient.find((e) => e.type === "session.start").session;
   assert.equal(start.model, "gpt-live-1");
-  assert.deepEqual(start.audio.format, { type: "audio/pcmu" });
+  assert.deepEqual(start.audio.format, { type: "audio/pcmu", rate: 8000 });
   assert.deepEqual(start.delegation, { type: "client" });
   assert.match(start.instructions, /Always speak Polish/);
   assert.match(start.instructions, /Cześć, test\./);
