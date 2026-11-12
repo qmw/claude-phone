@@ -1,6 +1,6 @@
 {
   "name": "call-me",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Lets Claude phone you (Twilio) with a spoken message and hear your spoken or keypad reply.",
   "author": { "name": "qmw" }
 }

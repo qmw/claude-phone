@@ -102,6 +102,19 @@ While Claude thinks, you hear silence. After 4 seconds you hear "one moment", an
 
 Claude always finishes its line, and it starts listening when the line ends, so anything you say during the line isn't heard. Set `CALL_ME_BARGE_IN=1` to be able to interrupt by talking, but then any sound on your side, including background noise, can cut the line off. If you stay silent twice after a line, the call ends.
 
+## Realtime voice (experimental)
+
+For a conversation without pauses, Claude can pass `realtime: true` to `call_me`. Then OpenAI's realtime voice model, `gpt-live-1`, does the talking. It answers at once, lets you interrupt naturally, and keeps you company while Claude works. Claude stays the brain: whenever you ask for something or give an instruction, the voice hands it to the session as a channel event, and Claude's answer, sent with `phone_reply`, is what the voice says. Warnings, refusals and numbers are said word for word, and the voice never takes passwords or PINs.
+
+It needs:
+- `OPENAI_API_KEY` in the config file,
+- a session started with the `claude-phone` launcher,
+- an upgraded Twilio account. Twilio's trial doesn't stream audio.
+
+The voice costs $0.05 a minute, plus Twilio's $0.0044 a minute for the audio stream, on top of the line. The call's audio also goes to OpenAI, not only to Twilio. Polish isn't on OpenAI's list of supported languages yet.
+
+`CALL_ME_REALTIME_VOICE` picks the voice (default `marin`), and `CALL_ME_OWNER_NAME` tells the voice whose assistant it is. Only Claude calling you works so far; calls you make to Claude still use the regular mode.
+
 ## A number per session
 
 Every session can have its own Twilio number, so you can call the session you want and know which one is calling you. Inside a session, run `/call-me:session`, or just tell Claude, for example *"use +17255550123 for this project, call my work phone, and let my private phone call you"*. Claude then sets these with the `call_me_settings` tool:

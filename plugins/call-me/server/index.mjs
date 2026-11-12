@@ -36,8 +36,10 @@ import {
   takeSaved,
   dndActive,
 } from "./lib.mjs";
+import { acceptUpgrade } from "./ws.mjs";
+import { RealtimeCall } from "./realtime.mjs";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -72,6 +74,8 @@ async function twilio(cfg, method, resource, form) {
 const pending = new Map(); // callId -> { resolve, profile }
 const heardSaved = new Map(); // inbound CallSid -> saved messages handed to the session after that call
 let webhook = null; // { port, publicUrl }
+const realtimePending = new Map(); // media-stream token -> options for the RealtimeCall
+const realtimeCalls = new Map(); // CallSid -> RealtimeCall
 
 // Live calls: the user stays on the line while Claude works out its next line (phone_reply).
 // CallSid -> { profile, lines: [{message, end}], heard: [], wake, turnStart, saidHold, lastNudge, lastSeen, ended }
@@ -241,6 +245,19 @@ async function startServer(initial) {
       return res.end(buildSayHangupTwiml(profile, params.SpeechResult ? profile.inboundAck : profile.inboundEmpty));
     }
     res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
+  });
+  // Realtime calls: Twilio opens the call's media stream here, at a single-use random path.
+  server.on("upgrade", (req, socket, head) => {
+    const token = new URL(req.url, "http://x").pathname.match(/^\/media\/([a-f0-9]{32})$/)?.[1];
+    const p = token && realtimePending.get(token);
+    if (!p) return socket.destroy();
+    realtimePending.delete(token);
+    const tw = acceptUpgrade(req, socket, head);
+    if (!tw) return;
+    const rt = new RealtimeCall({ ...p, notify, log, twilio, onEnd: (c) => setTimeout(() => realtimeCalls.delete(c.callSid), 60000) });
+    rt.attachTwilio(tw);
+    tw.once("message", () => setTimeout(() => rt.callSid && realtimeCalls.set(rt.callSid, rt), 0));
+    p.attached?.(rt);
   });
   const port = Number(initial.CALL_ME_PORT || 0);
   await new Promise((r) => server.listen(port, "127.0.0.1", r));
@@ -458,11 +475,12 @@ async function placeCall(cfg, to, profile, message, wait_for_reply, timeout_seco
   return { outcome, sid: call.sid };
 }
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false }) {
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime = false }) {
   const { cfg, missing } = config();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
+  if (realtime) return callMeRealtime(cfg, { message, language, force });
   const profile = speechProfile(cfg, language);
   const entry = { message, language: profile.language, project: path.basename(process.cwd()), cwd: process.cwd() };
   const dndMinutes = Number(cfg.CALL_ME_DND_MINUTES ?? 120);
@@ -514,7 +532,63 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
 }
 
 /** Say the next line on a live call and return what the user says back. */
-async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120 }) {
+/**
+ * Experimental: a live call where OpenAI's gpt-live-1 does the talking and Claude answers hand-offs with phone_reply.
+ * Returns once the call is connected (or failed); everything after that arrives as channel events.
+ */
+async function callMeRealtime(cfg, { message, language, force }) {
+  if (!INBOUND) throw new Error("Realtime calls need a session started with the claude-phone launcher (channels).");
+  if (!(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY))
+    throw new Error(`Realtime calls need OPENAI_API_KEY in ${CONFIG_PATH}.`);
+  if (!force && dndActive()) return RESULT.dnd;
+  const profile = speechProfile(cfg, language);
+  const { publicUrl } = await ensureWebhook(cfg);
+  const token = crypto.randomBytes(16).toString("hex");
+  let rt = null;
+  realtimePending.set(token, {
+    cfg,
+    language: profile.language,
+    opening: message,
+    project: path.basename(process.cwd()),
+    attached: (c) => (rt = c),
+  });
+  const streamUrl = `${publicUrl.replace(/^http/, "ws")}/media/${token}`;
+  const call = await twilio(cfg, "POST", "Calls.json", {
+    To: callTargets(cfg)[0],
+    From: cfg.TWILIO_FROM_NUMBER,
+    Twiml: `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${streamUrl}"/></Connect></Response>`,
+    Timeout: "30",
+  });
+  log(`placed realtime call ${call.sid}`);
+  const deadline = Date.now() + 75000;
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    if (rt?.ready) {
+      realtimeCalls.set(call.sid, rt);
+      return (
+        `Realtime call connected (call ${call.sid}). The voice (gpt-live-1) is talking with the user now. ` +
+        'Whenever it hands something to you, a channel event with realtime="true" arrives: answer with phone_reply(call_sid, message). ' +
+        "Answer quickly, send short progress updates during long work, and end with end_call: true."
+      );
+    }
+    if (rt?.ended) break;
+    const c = await twilio(cfg, "GET", `Calls/${call.sid}.json`).catch(() => null);
+    if (c && TERMINAL_STATUSES.has(c.status)) {
+      realtimePending.delete(token);
+      return `Realtime call did not connect: ${c.status}.`;
+    }
+  }
+  realtimePending.delete(token);
+  if (!rt?.ended) await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
+  return `Realtime call failed: ${rt?.ended || "the voice did not start within 75 s"}.`;
+}
+
+async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120, exact = false }) {
+  const rt = realtimeCalls.get(call_sid);
+  if (rt) {
+    if (!message || !String(message).trim()) throw new Error("message is required");
+    return rt.say(message, { endCall: end_call, exact });
+  }
   const { cfg } = config();
   const e = live.get(call_sid);
   if (!e) throw new Error(`No live call ${call_sid}. Use call_me to call the user.`);
@@ -663,6 +737,12 @@ const TOOLS = [
           type: "boolean",
           description: "Keep the call open after the user's reply for a live conversation: answer with phone_reply. Use when the user may want to talk it through.",
         },
+        realtime: {
+          type: "boolean",
+          description:
+            "Experimental: a fast realtime voice (OpenAI gpt-live-1) talks with the user and hands their requests to you as channel events; " +
+            "answer each with phone_reply. Needs OPENAI_API_KEY and a claude-phone session. Use only when the user asks for a realtime call.",
+        },
         language: {
           type: "string",
           enum: ["en-US", "pl-PL"],
@@ -686,6 +766,10 @@ const TOOLS = [
         message: { type: "string", description: "What to say. Plain spoken sentences." },
         end_call: { type: "boolean", description: "Say the message, then hang up (default false).", default: false },
         timeout_seconds: { type: "number", description: "Max seconds to wait for the user's answer (default 120).", default: 120 },
+        exact: {
+          type: "boolean",
+          description: "Realtime calls: have the voice say the message word for word (warnings, refusals, numbers). Default: it may phrase it naturally.",
+        },
       },
       required: ["call_sid", "message"],
     },
@@ -733,7 +817,10 @@ const CHANNEL_INSTRUCTIONS =
   "or if you need a decision, phone them back with the call_me tool, in the language they spoke (meta language). " +
   'When meta live="true" the user is still on the line, on hold: answer right away with phone_reply(call_sid, ...), ' +
   "which returns their next sentence, and keep the conversation going; end it with end_call: true. For work that takes more " +
-  "than about a minute (such as handing a task to another session), say you will call back, end the call, then use call_me.";
+  "than about a minute (such as handing a task to another session), say you will call back, end the call, then use call_me. " +
+  'When meta realtime="true", a separate fast voice is talking with the user and handed you this request: phone_reply returns at once, ' +
+  "and the next request comes as a new event. Answer within seconds; for longer work first send a short status (\"on it\"), " +
+  "then progress updates and the result, each with phone_reply. Use exact: true for warnings, refusals and numbers.";
 
 async function handle(msg) {
   const { id, method, params } = msg;
