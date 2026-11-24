@@ -6,7 +6,7 @@ import path from "node:path";
 import {
   parseEnv, loadConfig, buildCallTwiml, buildLiveTurnTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
   normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName, e164, projectConfigPath,
-  classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
+  classifyOutcome, saveForCallback, takeSaved, dndActive, readState, realtimeByDefault,
 } from "../plugins/call-me/server/lib.mjs";
 
 test("parseEnv handles comments, quotes, export", () => {
@@ -167,4 +167,20 @@ test("a project switching language does not inherit the machine config's voice a
   assert.equal(pl.intro, "Cześć, tu Claude.");
   // Without a project file, nothing changes.
   assert.equal(speechProfile(loadConfig({}, machine).cfg).voice, "Polly.Ewa");
+});
+
+test("realtimeByDefault: on when an engine is configured in a claude-phone session", () => {
+  const saved = process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  try {
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay" }, true), true);
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay" }, false), false); // plain claude session
+    assert.equal(realtimeByDefault({}, true), false); // not configured
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay", CALL_ME_REALTIME: "0" }, true), false);
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "1" }, true), false); // openai engine without a key
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "1", OPENAI_API_KEY: "k" }, true), true);
+    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "yes", CALL_ME_REALTIME_ENGINE: "relay" }, true), true);
+  } finally {
+    if (saved !== undefined) process.env.OPENAI_API_KEY = saved;
+  }
 });

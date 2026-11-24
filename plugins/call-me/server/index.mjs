@@ -24,6 +24,7 @@ import {
   buildHoldTwiml,
   buildLiveTurnTwiml,
   offlineUrl,
+  realtimeByDefault,
   allowedCaller,
   callTargets,
   machineName,
@@ -40,7 +41,7 @@ import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.10.2";
+const VERSION = "0.10.3";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -361,13 +362,19 @@ async function startTunnel(port) {
   return publicUrl;
 }
 
-async function ensureWebhook(cfg) {
-  if (webhook) return webhook;
-  const port = await startServer(cfg);
-  const publicUrl = cfg.CALL_ME_PUBLIC_URL ? cfg.CALL_ME_PUBLIC_URL.replace(/\/$/, "") : await startTunnel(port);
-  webhook = { port, publicUrl };
-  log(`webhook ready at ${publicUrl} -> 127.0.0.1:${port}`);
-  return webhook;
+let webhookStarting = null;
+
+/** One server and one tunnel per session, even when two callers ask at the same moment (startup claims the number while a call starts). */
+function ensureWebhook(cfg) {
+  if (webhook) return Promise.resolve(webhook);
+  webhookStarting ??= (async () => {
+    const port = await startServer(cfg);
+    const publicUrl = cfg.CALL_ME_PUBLIC_URL ? cfg.CALL_ME_PUBLIC_URL.replace(/\/$/, "") : await startTunnel(port);
+    webhook = { port, publicUrl };
+    log(`webhook ready at ${publicUrl} -> 127.0.0.1:${port}`);
+    return webhook;
+  })().finally(() => (webhookStarting = null));
+  return webhookStarting;
 }
 
 // --------------------------------------------- inbound: own the Twilio number
@@ -499,11 +506,12 @@ async function placeCall(cfg, to, profile, message, wait_for_reply, timeout_seco
   return { outcome, sid: call.sid };
 }
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime = false, engine }) {
+async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime, engine }) {
   const { cfg, missing } = config();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
+  if (realtime === undefined) realtime = wait_for_reply !== false && realtimeByDefault(cfg, INBOUND);
   if (realtime) return callMeRealtime(cfg, { message, language, force, engine });
   const profile = speechProfile(cfg, language);
   const entry = { message, language: profile.language, project: path.basename(process.cwd()), cwd: process.cwd() };
@@ -772,7 +780,9 @@ const TOOLS = [
           type: "boolean",
           description:
             "Experimental: a fast realtime voice (OpenAI gpt-live-1) talks with the user and hands their requests to you as channel events; " +
-            "answer each with phone_reply. Needs OPENAI_API_KEY and a claude-phone session. Use only when the user asks for a realtime call.",
+            "answer each with phone_reply. Needs a claude-phone session (and OPENAI_API_KEY for the openai engine). " +
+            "Omit it to use the configured default: on when realtime is set up (CALL_ME_REALTIME=1 or CALL_ME_REALTIME_ENGINE in the config) " +
+            "and wait_for_reply isn't false, otherwise off. Pass true or false only to override that, e.g. when the user asks for one kind of call.",
         },
         engine: {
           type: "string",

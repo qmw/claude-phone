@@ -306,3 +306,16 @@ export function takeSaved(dir = STATE_DIR) {
 }
 
 export const dndActive = (now = Date.now(), dir = STATE_DIR) => readState(dir).dndUntil > now;
+
+/**
+ * Realtime is the default when it is configured (CALL_ME_REALTIME=1, or a CALL_ME_REALTIME_ENGINE is set and
+ * CALL_ME_REALTIME isn't 0) and it can work here: a claude-phone session, and an OpenAI key for the OpenAI voice.
+ * One-way notifications (wait_for_reply false) stay plain calls.
+ */
+export function realtimeByDefault(cfg, inbound) {
+  const flag = String(cfg.CALL_ME_REALTIME ?? "").trim();
+  const on = flag ? /^(1|true|yes|on)$/i.test(flag) : !!cfg.CALL_ME_REALTIME_ENGINE;
+  if (!on || !inbound) return false;
+  const engine = cfg.CALL_ME_REALTIME_ENGINE || "openai";
+  return engine === "relay" || !!(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY);
+}
