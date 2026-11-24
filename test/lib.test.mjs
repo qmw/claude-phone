@@ -4,9 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  parseEnv, loadConfig, buildCallTwiml, buildLiveTurnTwiml, buildInboundTwiml, twilioSignature, validSignature, xmlEscape,
+  parseEnv, loadConfig, twilioSignature, validSignature, xmlEscape,
   normalizeLanguage, speechProfile, offlineUrl, samePhone, allowedCaller, machineName, e164, projectConfigPath,
-  classifyOutcome, saveForCallback, takeSaved, dndActive, readState, realtimeByDefault,
+  classifyOutcome, saveForCallback, takeSaved, dndActive, readState,
 } from "../plugins/call-me/server/lib.mjs";
 
 test("parseEnv handles comments, quotes, export", () => {
@@ -23,23 +23,6 @@ test("loadConfig: env overrides file and reports missing keys", () => {
   assert.deepEqual(missing, ["TWILIO_FROM_NUMBER", "CALL_ME_TO_NUMBER"]);
 });
 
-test("twiml escapes message and includes gather only when replying", () => {
-  const oneWay = buildCallTwiml("a < b & c", speechProfile({}), null);
-  assert.match(oneWay, /a &lt; b &amp; c/);
-  assert.doesNotMatch(oneWay, /Gather/);
-  const twoWay = buildCallTwiml("hi", speechProfile({ CALL_ME_LANGUAGE: "pl-PL" }), "https://x/gather/1?a=1&b=2");
-  assert.match(twoWay, /<Gather [^>]*action="https:\/\/x\/gather\/1\?a=1&amp;b=2"/);
-  assert.match(twoWay, /language="pl-PL"/);
-  assert.match(twoWay, /speechTimeout="3"/);
-  assert.match(buildCallTwiml("hi", speechProfile({ CALL_ME_SPEECH_TIMEOUT: "5" }), "https://x/g"), /speechTimeout="5"/);
-  assert.match(twoWay, /Nie dosłyszałem/);
-  assert.doesNotMatch(twoWay, /didn't catch/);
-  // No "say your reply now" by default: the first Gather just listens, without an empty <Say>.
-  assert.match(twoWay, /<Gather [^>]*><\/Gather>/);
-  assert.doesNotMatch(twoWay, /<Say[^>]*><\/Say>|naciśnij/);
-  assert.match(buildCallTwiml("hi", speechProfile({ CALL_ME_REPLY_PROMPT: "Mów." }), "https://x/g"), /<Gather [^>]*><Say[^>]*>Mów\.<\/Say>/);
-});
-
 test("normalizeLanguage accepts short forms and rejects unsupported", () => {
   assert.equal(normalizeLanguage("pl"), "pl-PL");
   assert.equal(normalizeLanguage("EN-us"), "en-US");
@@ -48,19 +31,13 @@ test("normalizeLanguage accepts short forms and rejects unsupported", () => {
   assert.throws(() => normalizeLanguage("de-DE"), /Unsupported language/);
 });
 
-test("speechProfile: per-call language wins; config overrides apply only to the default language", () => {
-  const cfg = { CALL_ME_LANGUAGE: "pl-PL", CALL_ME_VOICE: "Polly.Custom", CALL_ME_INTRO: "Siema." };
+test("speechProfile: per-call language wins; voice settings apply only to the language they were set for", () => {
+  const cfg = { CALL_ME_LANGUAGE: "pl-PL", CALL_ME_RELAY_TTS: "Amazon", CALL_ME_RELAY_VOICE: "Ola-Neural", CALL_ME_GREETING: "Siema, słucham." };
   const pl = speechProfile(cfg);
-  assert.deepEqual([pl.language, pl.voice, pl.intro], ["pl-PL", "Polly.Custom", "Siema."]);
+  assert.deepEqual([pl.language, pl.relayTts, pl.relayVoice, pl.inboundGreeting], ["pl-PL", "Amazon", "Ola-Neural", "Siema, słucham."]);
   const en = speechProfile(cfg, "en");
-  assert.deepEqual([en.language, en.voice, en.intro], ["en-US", "Polly.Joanna", "Hi, this is Claude."]);
-  assert.equal(speechProfile({ CALL_ME_INTRO: "" }).intro, "");
+  assert.deepEqual([en.language, en.relayTts, en.relayVoice, en.inboundGreeting], ["en-US", null, null, "Hi, this is Claude. I'm listening."]);
   assert.equal(speechProfile({}).language, "en-US");
-});
-
-test("inbound twiml gathers speech in the profile language", () => {
-  const x = buildInboundTwiml(speechProfile({}, "pl"), "https://x/incoming/gather");
-  assert.match(x, /<Gather input="speech" action="https:\/\/x\/incoming\/gather"[^>]*language="pl-PL"><Say[^>]*>Cześć, tu Claude. Słucham.<\/Say><\/Gather>/);
 });
 
 test("offlineUrl encodes TwiML for the Twimlets echo service", () => {
@@ -126,20 +103,6 @@ test("saved messages and do-not-disturb", () => {
   assert.equal((fs.statSync(path.join(dir, "state.json")).mode & 0o777), 0o600);
 });
 
-test("inbound twiml reads saved messages before listening", () => {
-  const x = buildInboundTwiml(speechProfile({ CALL_ME_LANGUAGE: "pl-PL" }), "https://x/g", [
-    { message: "Gotowe.", language: "pl-PL", project: "euro" },
-  ]);
-  assert.match(x, /Masz jedną zapisaną wiadomość\.<\/Say><Say[^>]*>Z projektu euro: Gotowe\.<\/Say><Pause length="1"\/><Gather/);
-});
-
-test("live line plays in full unless barge-in is enabled", () => {
-  const full = buildLiveTurnTwiml(speechProfile({}), "One. Two.", "https://x/g");
-  assert.match(full, /<Response><Say[^>]*>One\. Two\.<\/Say><Gather /);
-  const interruptible = buildLiveTurnTwiml(speechProfile({ CALL_ME_BARGE_IN: "1" }), "One. Two.", "https://x/g");
-  assert.match(interruptible, /<Response><Gather [^>]*><Say[^>]*>One\. Two\.<\/Say><\/Gather>/);
-});
-
 test("e164 normalises formatting and rejects non-numbers", () => {
   assert.equal(e164("+1 (725) 000-0002"), "+17250000002");
   assert.throws(() => e164("725 000 0002"), /E\.164/);
@@ -151,36 +114,17 @@ test("projectConfigPath gives each project directory its own file", () => {
   assert.notEqual(projectConfigPath("/home/a/x"), projectConfigPath("/home/a/y"));
 });
 
-test("a project switching language does not inherit the machine config's voice and phrases", () => {
+test("a project switching language does not inherit the machine config's voice", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cm-lang-"));
   const machine = path.join(dir, "config.env"), project = path.join(dir, "project.env");
-  fs.writeFileSync(machine, 'CALL_ME_LANGUAGE=pl-PL\nCALL_ME_VOICE=Polly.Ewa\nCALL_ME_INTRO="Cześć, tu Claude."\n');
+  fs.writeFileSync(machine, "CALL_ME_LANGUAGE=pl-PL\nCALL_ME_RELAY_TTS=Amazon\nCALL_ME_RELAY_VOICE=Ola-Neural\n");
   fs.writeFileSync(project, "CALL_ME_LANGUAGE=en-US\n");
   const { cfg } = loadConfig({}, machine, project);
   const en = speechProfile(cfg);
   assert.equal(en.language, "en-US");
-  assert.equal(en.voice, "Polly.Joanna");
-  assert.doesNotMatch(en.intro, /Cześć/);
-  // A Polish call from that project still gets the machine's Polish voice and intro.
-  const pl = speechProfile(cfg, "pl-PL");
-  assert.equal(pl.voice, "Polly.Ewa");
-  assert.equal(pl.intro, "Cześć, tu Claude.");
+  assert.equal(en.relayVoice, null);
+  // A Polish call from that project still gets the machine's Polish voice.
+  assert.equal(speechProfile(cfg, "pl-PL").relayVoice, "Ola-Neural");
   // Without a project file, nothing changes.
-  assert.equal(speechProfile(loadConfig({}, machine).cfg).voice, "Polly.Ewa");
-});
-
-test("realtimeByDefault: on when an engine is configured in a claude-phone session", () => {
-  const saved = process.env.OPENAI_API_KEY;
-  delete process.env.OPENAI_API_KEY;
-  try {
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay" }, true), true);
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay" }, false), false); // plain claude session
-    assert.equal(realtimeByDefault({}, true), false); // not configured
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME_ENGINE: "relay", CALL_ME_REALTIME: "0" }, true), false);
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "1" }, true), false); // openai engine without a key
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "1", OPENAI_API_KEY: "k" }, true), true);
-    assert.equal(realtimeByDefault({ CALL_ME_REALTIME: "yes", CALL_ME_REALTIME_ENGINE: "relay" }, true), true);
-  } finally {
-    if (saved !== undefined) process.env.OPENAI_API_KEY = saved;
-  }
+  assert.equal(speechProfile(loadConfig({}, machine).cfg).relayVoice, "Ola-Neural");
 });

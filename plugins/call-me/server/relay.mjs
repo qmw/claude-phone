@@ -1,16 +1,12 @@
-// Realtime calls through Twilio ConversationRelay (experimental): Twilio does the speech recognition (Deepgram) and
-// the voice (ElevenLabs by default, natural Polish), with smart interruptions. Claude in the session is the brain:
-// each finished sentence of the caller arrives as a channel event and phone_reply sends the answer, which Twilio
-// speaks. While Claude works, the caller hears a short filler at once and "still on it" now and then.
+// Calls through Twilio ConversationRelay: Twilio does the speech recognition (Deepgram) and the voice (ElevenLabs by
+// default, or the configured one), with smart interruptions. Claude in the session is the brain: each finished
+// sentence of the caller arrives as a channel event and phone_reply sends the answer, which Twilio speaks.
+// While Claude works the line stays quiet; after 25 s, and every 25 s after that, the caller hears "still on it".
 import { xmlEscape } from "./lib.mjs";
 
-const FILLERS = {
-  "pl-PL": { first: ["Chwileczkę."], still: "Nadal nad tym pracuję." },
-  "en-US": { first: ["One moment."], still: "Still working on it." },
-};
-
 /** TwiML that connects the call to our WebSocket through ConversationRelay. */
-export function relayTwiml({ url, language, greeting, cfg }) {
+export function relayTwiml({ url, profile, greeting, cfg }) {
+  const { language } = profile;
   const attrs = {
     url,
     language,
@@ -24,8 +20,8 @@ export function relayTwiml({ url, language, greeting, cfg }) {
     speechModel: "nova-3-general",
     hints: "Claude, AnyDesk, Twilio, GitHub, plugin",
   };
-  if (cfg.CALL_ME_RELAY_TTS) attrs.ttsProvider = cfg.CALL_ME_RELAY_TTS;
-  if (cfg.CALL_ME_RELAY_VOICE) attrs.voice = cfg.CALL_ME_RELAY_VOICE;
+  if (profile.relayTts) attrs.ttsProvider = profile.relayTts;
+  if (profile.relayVoice) attrs.voice = profile.relayVoice;
   const a = Object.entries(attrs)
     .map(([k, v]) => `${k}="${xmlEscape(v)}"`)
     .join(" ");
@@ -33,9 +29,8 @@ export function relayTwiml({ url, language, greeting, cfg }) {
 }
 
 export class RelayCall {
-  constructor({ cfg, language, opening, notify, log, twilio, onEnd, inbound = null }) {
-    Object.assign(this, { cfg, language, opening, notify, log, twilio, onEnd, inbound });
-    this.fillers = FILLERS[language] || FILLERS["en-US"];
+  constructor({ cfg, profile, opening, notify, log, twilio, onEnd, inbound = null, quiet = false }) {
+    Object.assign(this, { cfg, profile, language: profile.language, opening, notify, log, twilio, onEnd, inbound, quiet });
     this.callSid = null;
     this.ready = false;
     this.ended = null;
@@ -56,6 +51,7 @@ export class RelayCall {
         this.callSid = m.callSid;
         this.onCallSid?.(m.callSid);
         this.ready = true;
+        this.readyAt = Date.now();
         this.log(`relay call ${m.callSid} connected`);
       } else if (m.type === "prompt" && m.last !== false && m.voicePrompt?.trim()) this.heard(m.voicePrompt.trim());
       else if (m.type === "interrupt") {
@@ -69,6 +65,7 @@ export class RelayCall {
 
   heard(text) {
     this.transcript.push({ who: "caller", text });
+    if (this.quiet) return; // one-way message: nobody is listening for an answer
     if (!this.waiting) this.waiting = { since: Date.now(), filled: false, stillAt: Date.now() + 25000 };
     const recent = this.transcript
       .slice(-8)
@@ -97,18 +94,21 @@ export class RelayCall {
     });
   }
 
-  /** Keep the caller company while Claude works: a filler after 2.5 s (CALL_ME_RELAY_FILLER overrides it, "" turns it off), then "still on it" every 25 s. */
+  /**
+   * While Claude works the line stays quiet (a filler after every sentence got tiring); CALL_ME_RELAY_FILLER sets an
+   * optional short word said after 2.5 s. After 25 s, and every 25 s after that, the caller hears "still on it".
+   */
   tick() {
     const w = this.waiting;
     if (!w || this.ended) return;
     const now = Date.now();
-    if (!w.filled && now - w.since > 2500) {
+    const filler = String(this.cfg.CALL_ME_RELAY_FILLER || "").trim();
+    if (!w.filled && filler && now - w.since > 2500) {
       w.filled = true;
-      const filler = this.cfg.CALL_ME_RELAY_FILLER ?? this.fillers.first[Math.floor(Math.random() * this.fillers.first.length)];
-      if (filler.trim()) this.speak(filler, false);
+      this.speak(filler, false);
     } else if (now > w.stillAt) {
       w.stillAt = now + 25000;
-      this.speak(this.fillers.still, false);
+      this.speak(this.profile.stillWorking, false);
     }
   }
 
@@ -136,15 +136,16 @@ export class RelayCall {
     return 'Said. The caller\'s next sentence will arrive as a new channel event (realtime="true"). For longer work, send short progress updates with phone_reply.';
   }
 
-  async hangup() {
+  /** End the call. With the default reason the session gets no transcript (it ended the call itself). */
+  async hangup(reason = "Claude ended the call") {
     if (this.ended) return;
     this.ws.send({ type: "end", handoffData: JSON.stringify({ reason: "claude-ended" }) });
     const sid = this.callSid;
-    this.end("Claude ended the call"); // before the socket closes, so it isn't reported as the caller hanging up
+    this.end(reason, { silent: true }); // before the socket closes, so it isn't reported as the caller hanging up
     if (sid) await this.twilio(this.cfg, "POST", `Calls/${sid}.json`, { Status: "completed" }).catch(() => {});
   }
 
-  end(reason) {
+  end(reason, { silent = false } = {}) {
     if (this.ended) return;
     this.ended = reason;
     clearInterval(this.timer);
@@ -152,7 +153,7 @@ export class RelayCall {
     this.log(`relay call ${this.callSid} ended: ${reason}`);
     const transcript = this.transcript.map((t) => `${t.who === "caller" ? "Caller" : "You"}: ${t.text}`).join("\n");
     const unsent = !this.savedSent && this.inbound?.saved?.length ? this.inbound.saved : [];
-    if (reason !== "Claude ended the call")
+    if (!silent && !this.quiet)
       this.notify("notifications/claude/channel", {
         content:
           `The realtime call has ended (${reason}). Transcript:\n${transcript}` +

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// call-me MCP server: lets Claude phone you via Twilio and hear your spoken reply.
-// With CALL_ME_INBOUND=1 it also takes over the Twilio number so you can call Claude:
-// what you say is pushed into the session as a channel event (Claude Code "channels").
+// call-me MCP server: lets Claude phone you via Twilio and talk with you in real time (Twilio ConversationRelay:
+// Deepgram hears you, a natural voice speaks Claude's lines). With CALL_ME_INBOUND=1 (the claude-phone launcher)
+// it also takes over the Twilio number so you can call Claude; everything you say on a call is pushed into the
+// session as a channel event (Claude Code "channels") and Claude answers with phone_reply.
 // Zero dependencies — speaks MCP (JSON-RPC over stdio) directly.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -18,13 +19,7 @@ import {
   e164,
   normalizeLanguage,
   speechProfile,
-  buildCallTwiml,
-  buildSayHangupTwiml,
-  buildInboundTwiml,
-  buildHoldTwiml,
-  buildLiveTurnTwiml,
   offlineUrl,
-  realtimeByDefault,
   allowedCaller,
   callTargets,
   machineName,
@@ -36,12 +31,13 @@ import {
   saveForCallback,
   takeSaved,
   dndActive,
+  XML,
 } from "./lib.mjs";
 import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.10.3";
+const VERSION = "0.11.0";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -73,71 +69,12 @@ async function twilio(cfg, method, resource, form) {
 
 // ---------------------------------------------------- webhook server + tunnel
 
-const pending = new Map(); // callId -> { resolve, profile }
-const heardSaved = new Map(); // inbound CallSid -> saved messages handed to the session after that call
 let webhook = null; // { port, publicUrl }
-const realtimePending = new Map(); // media-stream token -> options for the RealtimeCall
-const realtimeCalls = new Map(); // CallSid -> RealtimeCall
+const realtimePending = new Map(); // single-use socket token -> options for the call object
+const realtimeCalls = new Map(); // CallSid -> RelayCall | RealtimeCall
+const amdPending = new Map(); // token -> outbound attempt waiting for answering-machine detection
 
-// Live calls: the user stays on the line while Claude works out its next line (phone_reply).
-// CallSid -> { profile, lines: [{message, end}], heard: [], wake, turnStart, saidHold, lastNudge, lastSeen, ended }
-const live = new Map();
-
-function startLive(sid, profile) {
-  const now = Date.now();
-  live.set(sid, { profile, lines: [], heard: [], wake: null, turnStart: now, saidHold: false, lastNudge: now, lastSeen: now, ended: null });
-}
-
-function endLive(e, reason) {
-  e.ended = e.ended || reason;
-  e.wake?.();
-}
-
-/** Twilio polls this while the user is on hold. */
-function liveWait(cfg, e) {
-  const p = e.profile;
-  const { publicUrl } = webhook;
-  e.lastSeen = Date.now();
-  const line = e.lines.shift();
-  if (line) {
-    e.wake?.();
-    if (line.end) {
-      endLive(e, "ended by Claude");
-      return buildSayHangupTwiml(p, line.message);
-    }
-    return buildLiveTurnTwiml(p, line.message, `${publicUrl}/live/gather`);
-  }
-  const waited = Date.now() - e.turnStart;
-  if (waited > Number(cfg.CALL_ME_LIVE_HOLD || 120) * 1000) {
-    endLive(e, "hold-timeout");
-    return buildSayHangupTwiml(p, p.holdTimeout);
-  }
-  let text = null;
-  if (!e.saidHold && waited > 4000) {
-    e.saidHold = true;
-    e.lastNudge = Date.now();
-    text = p.hold;
-  } else if (e.saidHold && Date.now() - e.lastNudge > 25000) {
-    e.lastNudge = Date.now();
-    text = p.stillWorking;
-  }
-  return buildHoldTwiml(p, `${publicUrl}/live/wait`, text);
-}
-
-/** The user spoke (or stayed silent) after Claude's line. */
-function liveHeard(e, params) {
-  e.lastSeen = Date.now();
-  const said = params.SpeechResult || (params.Digits ? `(pressed keys ${params.Digits})` : null);
-  if (!said) {
-    endLive(e, "no-reply");
-    return buildSayHangupTwiml(e.profile, e.profile.noReply);
-  }
-  e.heard.push(said);
-  e.turnStart = Date.now();
-  e.saidHold = false;
-  e.wake?.();
-  return buildHoldTwiml(e.profile, `${webhook.publicUrl}/live/wait`, null);
-}
+const wsBase = () => webhook.publicUrl.replace(/^http/, "ws");
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -152,12 +89,8 @@ async function startServer(initial) {
     const { cfg } = config();
     const url = new URL(req.url, "http://x");
     if (url.pathname === "/health") return res.end("ok");
-    const outbound = url.pathname.match(/^\/gather\/([a-f0-9]{32})$/);
     const amdRoute = url.pathname.match(/^\/amd\/([a-f0-9]{32})$/);
-    const liveRoute = url.pathname.match(/^\/live\/(wait|gather)$/);
-    const known =
-      (outbound && pending.has(outbound[1])) ||
-      (amdRoute && pending.has(amdRoute[1])) || liveRoute || (INBOUND && /^\/incoming(\/gather)?$/.test(url.pathname));
+    const known = (amdRoute && amdPending.has(amdRoute[1])) || (INBOUND && url.pathname === "/incoming");
     if (req.method !== "POST" || !known) {
       res.statusCode = 404;
       return res.end();
@@ -172,29 +105,9 @@ async function startServer(initial) {
     res.setHeader("Content-Type", "text/xml");
 
     if (amdRoute) {
-      // Async answering machine detection: the message is already playing; the call loop hangs up on a machine.
-      pending.get(amdRoute[1]).answeredBy = params.AnsweredBy || "unknown";
+      // Answering-machine detection runs in the background while the call already talks; the dialer acts on it.
+      amdPending.get(amdRoute[1]).answeredBy = params.AnsweredBy || "unknown";
       return res.end();
-    }
-
-    if (liveRoute) {
-      const e = live.get(params.CallSid);
-      if (!e || e.ended) return res.end(buildSayHangupTwiml(speechProfile(cfg), speechProfile(cfg).bye));
-      return res.end(liveRoute[1] === "wait" ? liveWait(cfg, e) : liveHeard(e, params));
-    }
-
-    if (outbound) {
-      const { resolve, profile, stayOnLine } = pending.get(outbound[1]);
-      resolve({
-        speech: params.SpeechResult || null,
-        confidence: params.Confidence ? Number(params.Confidence) : null,
-        digits: params.Digits || null,
-      });
-      if (stayOnLine && (params.SpeechResult || params.Digits)) {
-        startLive(params.CallSid, profile);
-        return res.end(buildHoldTwiml(profile, `${webhook.publicUrl}/live/wait`, null));
-      }
-      return res.end(buildSayHangupTwiml(profile, profile.ack));
     }
 
     // Inbound: only the user's own phones may talk to the session.
@@ -203,66 +116,20 @@ async function startServer(initial) {
       log(`rejected inbound call from ${params.From}`);
       return res.end(REJECT_TWIML);
     }
-    if (url.pathname === "/incoming") {
-      // The user calling in is also "calling back": it ends do-not-disturb and hands the saved messages to this
-      // session. They are read aloud first only with CALL_ME_READ_SAVED=1.
-      const saved = takeSaved();
-      if (cfg.CALL_ME_INBOUND_ENGINE === "relay") {
-        // Realtime: the call goes to ConversationRelay; each sentence reaches the session, phone_reply answers.
-        const token = crypto.randomBytes(16).toString("hex");
-        realtimePending.set(token, {
-          engine: "relay",
-          cfg,
-          language: profile.language,
-          opening: profile.inboundGreeting,
-          inbound: { from: params.From, to: params.To || cfg.TWILIO_FROM_NUMBER, machine: machineName(cfg), saved },
-        });
-        setTimeout(() => realtimePending.delete(token), 60000);
-        log(`inbound realtime call from ${params.From}`);
-        return res.end(
-          relayTwiml({ url: `${webhook.publicUrl.replace(/^http/, "ws")}/relay/${token}`, language: profile.language, greeting: profile.inboundGreeting, cfg }),
-        );
-      }
-      if (saved.length) heardSaved.set(params.CallSid, saved);
-      const readAloud = cfg.CALL_ME_READ_SAVED === "1";
-      return res.end(
-        buildInboundTwiml(profile, `${webhook.publicUrl}/incoming/gather`, readAloud ? saved : [], saved.length > 0),
-      );
-    }
-    const saved = heardSaved.get(params.CallSid) || [];
-    heardSaved.delete(params.CallSid);
-    if (params.SpeechResult || saved.length) {
-      log(`inbound message from ${params.From}`);
-      const readAloud = cfg.CALL_ME_READ_SAVED === "1";
-      let content = params.SpeechResult || "(the user said nothing)";
-      if (saved.length)
-        content +=
-          (readAloud
-            ? "\n\nBefore speaking, the user heard these saved messages from earlier unanswered calls " +
-              "(route any answer to the session working in that project):\n"
-            : "\n\nSaved messages from earlier unanswered calls. The user has NOT heard them: do not read them out on the call " +
-              "unless asked; list them on screen (project and gist) and pass them to the sessions working in those projects:\n") +
-          saved.map((m) => `- [${m.project}, ${m.cwd}, ${m.at}] ${m.message}`).join("\n");
-      const liveCall = !NO.test(cfg.CALL_ME_LIVE || "") && !!params.SpeechResult;
-      if (liveCall) startLive(params.CallSid, profile);
-      notify("notifications/claude/channel", {
-        content,
-        meta: {
-          live: String(liveCall),
-          from: params.From,
-          to: params.To || cfg.TWILIO_FROM_NUMBER,
-          machine: machineName(cfg),
-          language: profile.language,
-          confidence: params.Confidence ? Number(params.Confidence).toFixed(2) : "unknown",
-          call_sid: params.CallSid,
-          saved_messages: String(saved.length),
-          saved_messages_heard: String(readAloud ? saved.length : 0),
-        },
-      });
-      if (liveCall) return res.end(buildHoldTwiml(profile, `${webhook.publicUrl}/live/wait`, null));
-      return res.end(buildSayHangupTwiml(profile, params.SpeechResult ? profile.inboundAck : profile.inboundEmpty));
-    }
-    res.end(buildSayHangupTwiml(profile, profile.inboundEmpty));
+    // The user calling in is also "calling back": it ends do-not-disturb and hands the saved messages to this
+    // session with the first sentence (they aren't read aloud).
+    const saved = takeSaved();
+    const token = crypto.randomBytes(16).toString("hex");
+    realtimePending.set(token, {
+      engine: "relay",
+      cfg,
+      profile,
+      opening: profile.inboundGreeting,
+      inbound: { from: params.From, to: params.To || cfg.TWILIO_FROM_NUMBER, machine: machineName(cfg), saved },
+    });
+    setTimeout(() => realtimePending.delete(token), 60000);
+    log(`inbound call from ${params.From}`);
+    res.end(relayTwiml({ url: `${wsBase()}/relay/${token}`, profile, greeting: profile.inboundGreeting, cfg }));
   });
   // Realtime calls: Twilio opens the call's media stream here, at a single-use random path.
   server.on("upgrade", (req, socket, head) => {
@@ -275,10 +142,10 @@ async function startServer(initial) {
     const onEnd = (c) => setTimeout(() => realtimeCalls.delete(c.callSid), 60000);
     let rt;
     if (p.engine === "relay") {
-      rt = new RelayCall({ ...p, notify, log, twilio, onEnd });
+      rt = new RelayCall({ ...p, notify: p.notify || notify, log, twilio, onEnd });
       rt.attach(tw);
     } else {
-      rt = new RealtimeCall({ ...p, notify, log, twilio, onEnd });
+      rt = new RealtimeCall({ ...p, notify: p.notify || notify, log, twilio, onEnd });
       rt.attachTwilio(tw);
     }
     rt.onCallSid = (sid) => realtimeCalls.set(sid, rt);
@@ -439,80 +306,110 @@ const RESULT = {
   canceled: "Call was canceled.",
 };
 
-/** One outbound call attempt. Returns { outcome, reply, sid }. */
-async function placeCall(cfg, to, profile, message, wait_for_reply, timeout_seconds, stayOnLine = false) {
-  const callId = crypto.randomBytes(16).toString("hex");
-  let gatherUrl = null;
-  let replyPromise = new Promise(() => {});
-  let entry = null;
-  if (wait_for_reply) {
-    const { publicUrl } = await ensureWebhook(cfg);
-    gatherUrl = `${publicUrl}/gather/${callId}`;
-    replyPromise = new Promise((resolve) => {
-      entry = { resolve, profile, stayOnLine, answeredBy: null };
-      pending.set(callId, entry);
-    });
-  }
+/** Seconds Twilio takes to say a line (about 14 characters a second), plus a margin. */
+const speakingMs = (text) => 1500 + (String(text).length / 14) * 1000;
 
+/**
+ * One outbound call attempt. The call talks from the moment it is picked up (ConversationRelay says `message`
+ * first); answering-machine detection runs in the background. Until it says "human", whatever the call hears is
+ * held back from the session, so a voicemail greeting never reaches Claude as if the user had said it.
+ * Returns { outcome, sid, rt }.
+ */
+async function placeCall(cfg, to, profile, message, { conversation, engine }) {
+  const { publicUrl } = await ensureWebhook(cfg);
+  const token = crypto.randomBytes(16).toString("hex");
   const amd = cfg.CALL_ME_AMD !== "0";
-  // With a webhook, detection runs in the background (AsyncAmd) so the message starts as soon as the user
-  // picks up; synchronous detection made them wait in silence for a few seconds first.
-  const amdParams = !amd
-    ? {}
-    : entry
+  const attempt = { answeredBy: null, rt: null };
+  const gate = { open: !amd, queue: [] };
+  const gatedNotify = (method, params) => (gate.open ? notify(method, params) : gate.queue.push([method, params]));
+  amdPending.set(token, attempt);
+  realtimePending.set(token, {
+    engine,
+    cfg,
+    profile,
+    opening: message,
+    project: path.basename(process.cwd()),
+    quiet: !conversation,
+    notify: gatedNotify,
+    attached: (c) => (attempt.rt = c),
+  });
+  const call = await twilio(cfg, "POST", "Calls.json", {
+    To: to,
+    From: cfg.TWILIO_FROM_NUMBER,
+    Twiml:
+      engine === "relay"
+        ? relayTwiml({ url: `${wsBase()}/relay/${token}`, profile, greeting: message, cfg })
+        : `${XML}<Response><Connect><Stream url="${wsBase()}/media/${token}"/></Connect></Response>`,
+    Timeout: "30",
+    ...(amd
       ? {
           MachineDetection: "Enable",
           MachineDetectionTimeout: "8",
           AsyncAmd: "true",
-          AsyncAmdStatusCallback: `${webhook.publicUrl}/amd/${callId}`,
+          AsyncAmdStatusCallback: `${publicUrl}/amd/${token}`,
           AsyncAmdStatusCallbackMethod: "POST",
         }
-      : { MachineDetection: "Enable", MachineDetectionTimeout: "8" };
-  const call = await twilio(cfg, "POST", "Calls.json", {
-    To: to,
-    From: cfg.TWILIO_FROM_NUMBER,
-    Twiml: buildCallTwiml(message, profile, gatherUrl),
-    Timeout: "30",
-    ...amdParams,
+      : {}),
   });
-  log(`placed call ${call.sid}`);
+  log(`placed call ${call.sid} to ${to}`);
+  const open = () => {
+    gate.open = true;
+    for (const [m, p] of gate.queue.splice(0)) notify(m, p);
+  };
 
-  const deadline = Date.now() + timeout_seconds * 1000;
-  let reply = null;
-  let c = call;
-  replyPromise.then((r) => (reply = r));
   try {
+    const deadline = Date.now() + 90000;
+    let c = call;
+    let readyAt = 0;
     while (Date.now() < deadline) {
-      await Promise.race([replyPromise, sleep(1000)]);
-      if (reply) break;
-      c = await twilio(cfg, "GET", `Calls/${call.sid}.json`);
-      // Voicemail picked up (= the user rejected the call): hang up before leaving a message.
-      if (/^(machine|fax)/.test(entry?.answeredBy || c.answered_by || "") && !TERMINAL_STATUSES.has(c.status)) {
-        await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
-        c = { ...c, status: "completed" };
-        break;
+      await sleep(500);
+      const { rt } = attempt;
+      const by = attempt.answeredBy || "";
+      // Voicemail picked up (= the user rejected the call): hang up before it records much.
+      if (/^(machine|fax)/.test(by)) {
+        gate.queue.length = 0;
+        if (rt) await rt.hangup("voicemail");
+        else await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
+        return { outcome: "rejected", sid: call.sid };
       }
-      if (TERMINAL_STATUSES.has(c.status)) break;
+      if (rt?.ready && !rt.ended) {
+        readyAt ||= Date.now();
+        // A person: detection says so, or it can't tell, or it is off, or it takes too long.
+        if (!amd || /^(human|unknown)/.test(by) || Date.now() - readyAt > 10000) {
+          open();
+          return { outcome: "answered", sid: call.sid, rt };
+        }
+        continue;
+      }
+      if (!rt?.ready || rt?.ended) {
+        c = await twilio(cfg, "GET", `Calls/${call.sid}.json`).catch(() => c);
+        if (TERMINAL_STATUSES.has(c.status)) break;
+      }
     }
+    if (!TERMINAL_STATUSES.has(c.status)) {
+      await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
+      return { outcome: attempt.rt?.ended ? `failed (${attempt.rt.ended})` : "timed-out", sid: call.sid };
+    }
+    const outcome = classifyOutcome({ status: c.status, answeredBy: amd ? attempt.answeredBy || c.answered_by || "unknown" : null, duration: c.duration });
+    // Picked up but gone before we knew it was a person: they most likely didn't hear the message.
+    return { outcome: outcome === "answered" ? "short" : outcome, sid: call.sid };
   } finally {
-    pending.delete(callId);
+    amdPending.delete(token);
+    realtimePending.delete(token);
   }
-  if (reply) return { outcome: "answered", reply, sid: call.sid };
-  if (!TERMINAL_STATUSES.has(c.status)) {
-    await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
-    return { outcome: "timed-out", sid: call.sid };
-  }
-  const outcome = classifyOutcome({ status: c.status, answeredBy: amd ? entry?.answeredBy || c.answered_by || "unknown" : null, duration: c.duration });
-  return { outcome, sid: call.sid };
 }
 
-async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, language, retries, force = false, stay_on_line = false, realtime, engine }) {
+async function callMe({ message, wait_for_reply = true, language, retries, force = false, engine }) {
   const { cfg, missing } = config();
   if (missing.length)
     throw new Error(`call-me is not configured. Missing ${missing.join(", ")} in ${CONFIG_PATH} (run /call-me:setup).`);
   if (!message || !String(message).trim()) throw new Error("message is required");
-  if (realtime === undefined) realtime = wait_for_reply !== false && realtimeByDefault(cfg, INBOUND);
-  if (realtime) return callMeRealtime(cfg, { message, language, force, engine });
+  // A conversation needs the channel that carries the user's words into the session (the claude-phone launcher).
+  const conversation = wait_for_reply !== false && INBOUND;
+  engine = conversation ? engine || cfg.CALL_ME_REALTIME_ENGINE || "relay" : "relay";
+  if (!["openai", "relay"].includes(engine)) throw new Error('engine must be "openai" or "relay"');
+  if (engine === "openai" && !(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY))
+    throw new Error(`The OpenAI voice needs OPENAI_API_KEY in ${CONFIG_PATH}; use engine "relay".`);
   const profile = speechProfile(cfg, language);
   const entry = { message, language: profile.language, project: path.basename(process.cwd()), cwd: process.cwd() };
   const dndMinutes = Number(cfg.CALL_ME_DND_MINUTES ?? 120);
@@ -529,7 +426,7 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
   let r, to;
   rounds: for (let attempt = 0; ; attempt++) {
     for (to of targets) {
-      r = await placeCall(cfg, to, profile, message, wait_for_reply || stay_on_line, timeout_seconds, stay_on_line);
+      r = await placeCall(cfg, to, profile, message, { conversation, engine });
       log(`round ${attempt + 1}, ${to}: ${r.outcome}`);
       if (!RETRYABLE.has(r.outcome)) break rounds;
     }
@@ -541,13 +438,23 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
   const tag = ` (call ${r.sid}` + (targets.length > 1 ? `, to ${to}${to === targets[0] ? "" : ", a backup phone"})` : ")");
   switch (r.outcome) {
     case "answered": {
-      const onLine = live.has(r.sid)
-        ? ` The user is still on the line: answer with phone_reply (call_sid "${r.sid}") right away; end with end_call: true.`
-        : "";
-      if (r.reply?.speech)
-        return `User replied by voice: "${r.reply.speech}"` + (r.reply.confidence != null ? ` (confidence ${r.reply.confidence.toFixed(2)})` : "") + tag + onLine;
-      if (r.reply?.digits) return `User pressed keys: ${r.reply.digits}${tag}${onLine}`;
-      return (wait_for_reply ? "Call was answered but the user gave no reply." : "Call answered; message was delivered.") + tag;
+      if (!conversation) {
+        // One-way: let the message play out, then hang up.
+        const left = speakingMs(message) - (Date.now() - (r.rt.readyAt || Date.now()));
+        await sleep(Math.max(0, left));
+        await r.rt.hangup();
+        return (
+          "Call answered; message was delivered." +
+          tag +
+          (wait_for_reply !== false ? " The user's answer could not be heard: this session wasn't started with the claude-phone launcher." : "")
+        );
+      }
+      realtimeCalls.set(r.sid, r.rt);
+      return (
+        `The user picked up and is hearing your message${tag}. Everything they say arrives as channel events ` +
+        '(realtime="true"): answer each with phone_reply(call_sid, message) within seconds, send short progress updates ' +
+        "during longer work, and end the call with end_call: true."
+      );
     }
     case "rejected":
       saveForCallback(entry, { dndMinutes });
@@ -556,123 +463,26 @@ async function callMe({ message, wait_for_reply = true, timeout_seconds = 180, l
     case "busy":
       saveForCallback(entry);
       return RESULT.exhausted(maxRetries + 1, targets.length) + tag;
-    case "timed-out":
-      return `No reply within ${timeout_seconds}s; call was ended.${tag}`;
     default:
       return (RESULT[r.outcome] || `Call ended with status ${r.outcome}.`) + tag;
   }
 }
 
-/** Say the next line on a live call and return what the user says back. */
-/**
- * Experimental: a live call where OpenAI's gpt-live-1 does the talking and Claude answers hand-offs with phone_reply.
- * Returns once the call is connected (or failed); everything after that arrives as channel events.
- */
-async function callMeRealtime(cfg, { message, language, force, engine }) {
-  engine = engine || cfg.CALL_ME_REALTIME_ENGINE || "openai";
-  if (!["openai", "relay"].includes(engine)) throw new Error('engine must be "openai" or "relay"');
-  if (!INBOUND) throw new Error("Realtime calls need a session started with the claude-phone launcher (channels).");
-  if (engine === "openai" && !(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY))
-    throw new Error(`Realtime calls with the OpenAI voice need OPENAI_API_KEY in ${CONFIG_PATH}.`);
-  if (!force && dndActive()) return RESULT.dnd;
-  const profile = speechProfile(cfg, language);
-  const { publicUrl } = await ensureWebhook(cfg);
-  const token = crypto.randomBytes(16).toString("hex");
-  let rt = null;
-  realtimePending.set(token, {
-    engine,
-    cfg,
-    language: profile.language,
-    opening: message,
-    project: path.basename(process.cwd()),
-    attached: (c) => (rt = c),
-  });
-  const wsBase = publicUrl.replace(/^http/, "ws");
-  const call = await twilio(cfg, "POST", "Calls.json", {
-    To: callTargets(cfg)[0],
-    From: cfg.TWILIO_FROM_NUMBER,
-    Twiml:
-      engine === "relay"
-        ? relayTwiml({ url: `${wsBase}/relay/${token}`, language: profile.language, greeting: message, cfg })
-        : `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${wsBase}/media/${token}"/></Connect></Response>`,
-    Timeout: "30",
-  });
-  log(`placed realtime call ${call.sid}`);
-  const deadline = Date.now() + 75000;
-  while (Date.now() < deadline) {
-    await sleep(1000);
-    if (rt?.ready) {
-      realtimeCalls.set(call.sid, rt);
-      return (
-        `Realtime call connected (call ${call.sid}, ${engine === "relay" ? "Twilio ConversationRelay voice" : "OpenAI gpt-live-1 voice"}). ` +
-        'Whenever it hands something to you, a channel event with realtime="true" arrives: answer with phone_reply(call_sid, message). ' +
-        "Answer quickly, send short progress updates during long work, and end with end_call: true."
-      );
-    }
-    if (rt?.ended) break;
-    const c = await twilio(cfg, "GET", `Calls/${call.sid}.json`).catch(() => null);
-    if (c && TERMINAL_STATUSES.has(c.status)) {
-      realtimePending.delete(token);
-      return `Realtime call did not connect: ${c.status}.`;
-    }
-  }
-  realtimePending.delete(token);
-  if (!rt?.ended) await twilio(cfg, "POST", `Calls/${call.sid}.json`, { Status: "completed" }).catch(() => {});
-  return `Realtime call failed: ${rt?.ended || "the voice did not start within 75 s"}.`;
-}
-
-async function phoneReply({ call_sid, message, end_call = false, timeout_seconds = 120, exact = false, voice }) {
+/** Claude's next line on a call. Returns at once: the user's next sentence comes as a new channel event. */
+async function phoneReply({ call_sid, message, end_call = false, exact = false, voice }) {
   const rt = realtimeCalls.get(call_sid);
-  if (rt) {
-    if (!message || !String(message).trim()) throw new Error("message is required");
-    if (voice && !(rt instanceof RelayCall)) throw new Error("voice can only change on ConversationRelay calls");
-    return rt.say(message, { endCall: end_call, exact, voice });
-  }
-  const { cfg } = config();
-  const e = live.get(call_sid);
-  if (!e) throw new Error(`No live call ${call_sid}. Use call_me to call the user.`);
-  if (e.ended) {
-    live.delete(call_sid);
-    return `The call has already ended (${e.ended}); nothing was said. Use call_me if the user still needs to hear it.`;
-  }
+  if (!rt) throw new Error(`No call ${call_sid} on this session. Use call_me to call the user.`);
   if (!message || !String(message).trim()) throw new Error("message is required");
-  e.heard.length = 0; // anything said before this line has already been answered or is stale
-  e.lines.push({ message, end: end_call });
-  const deadline = Date.now() + (end_call ? 15 : timeout_seconds) * 1000;
-  let lastCheck = Date.now();
-  while (Date.now() < deadline) {
-    if (end_call ? !e.lines.length : e.heard.length || e.ended) break;
-    await new Promise((r) => {
-      e.wake = r;
-      setTimeout(r, 1000);
-    });
-    e.wake = null;
-    // Twilio polls at least every few seconds while the call is up; long silence means the user may have hung up.
-    if (Date.now() - e.lastSeen > 20000 && Date.now() - lastCheck > 5000) {
-      lastCheck = Date.now();
-      const c = await twilio(cfg, "GET", `Calls/${call_sid}.json`).catch(() => null);
-      if (c && TERMINAL_STATUSES.has(c.status)) endLive(e, "the user hung up");
-    }
-  }
-  if (end_call) {
-    live.delete(call_sid);
-    return e.lines.length ? "The call ended before the line could be said." : "Said it and hung up.";
-  }
-  if (e.heard.length) return `User said: "${e.heard.splice(0).join(" ")}" (still on the line; answer with phone_reply)`;
-  if (e.ended) {
-    live.delete(call_sid);
-    return e.ended === "no-reply"
-      ? "The user said nothing after your line; the call was ended."
-      : `The call has ended (${e.ended}).` + (e.lines.length ? " Your line was not said." : "");
-  }
-  return `No reply within ${timeout_seconds}s; the user is still on hold. Call phone_reply again or end the call with end_call: true.`;
+  if (voice && !(rt instanceof RelayCall)) throw new Error("voice can only change on ConversationRelay calls");
+  return rt.say(message, { endCall: end_call, exact, voice });
 }
 
 /** Where a Twilio number's calls currently go, judged from its voice URL. */
 function numberOwner(n) {
   const url = n.voice_url || "";
   if (ownedNumber && url === ownedNumber.voiceUrl) return "answered by THIS session";
-  if (/trycloudflare\.com\/incoming$/.test(url)) return "answered by another call-me session";
+  // Any call-me session points the number at <its public URL>/incoming (quick tunnel or a permanent address).
+  if (/^https:\/\/[^/]+\/incoming$/.test(url)) return "answered by another call-me session";
   if (/twimlets\.com\/echo/.test(url)) return "free (plays the offline message)";
   return url ? "used by another app" : "free (no voice URL)";
 }
@@ -756,40 +566,32 @@ const TOOLS = [
   {
     name: "call_me",
     description:
-      "Phone the user and speak a message aloud (text-to-speech), then optionally listen for their spoken or keypad reply and return it. " +
+      "Phone the user for a live conversation: a natural voice says your message the moment they pick up, then everything they say " +
+      "reaches you as channel events (realtime=\"true\") and you answer each with phone_reply. " +
       "Use when the user asked to be called, when a long-running task finishes or fails and they asked to be notified, " +
       "or when you are blocked on a decision and the user said they may be away from the screen. " +
-      "Keep the message short and speakable (no code, URLs, or markdown). If you need a decision, phrase it as a question with simple options. " +
-      "Write the message in the call's language. " +
-      "Rules (enforced by the tool): an unanswered or busy call is retried automatically (default 4 more times, 90 s apart); " +
-      "if the user rejects the call, it is not retried and later calls are held until the user calls back; " +
+      "Keep the message short and speakable (no code, URLs, or markdown); end with a question if you need a decision. " +
+      "Write the message in the call's language. The tool returns once the user picks up (or doesn't). " +
+      "Rules (enforced by the tool): an unanswered or busy call is retried automatically (default 4 more times, 90 s apart), " +
+      "ringing the backup phones too; if the user rejects the call, it is not retried and later calls are held until the user calls back; " +
       "undelivered messages are saved and passed on when the user calls in. Never loop on this tool yourself.",
     inputSchema: {
       type: "object",
       properties: {
-        message: { type: "string", description: "What to say on the call. Plain spoken sentences, ideally under ~60 words." },
-        wait_for_reply: { type: "boolean", description: "Listen for and return the user's reply (default true). Set false for a one-way notification.", default: true },
-        timeout_seconds: { type: "number", description: "Max seconds to wait for the call to finish (default 180).", default: 180 },
+        message: { type: "string", description: "What to say first on the call. Plain spoken sentences, ideally under ~60 words." },
+        wait_for_reply: {
+          type: "boolean",
+          description: "false for a one-way notification: the message is said and the call hangs up (default true: a conversation).",
+          default: true,
+        },
         retries: { type: "number", description: "Extra attempts if the user doesn't pick up (default 4, 90 s apart). Use 0 for anything not worth repeating." },
         force: { type: "boolean", description: "Call even though the user rejected an earlier call. Only when the user explicitly asked to be called now." },
-        stay_on_line: {
-          type: "boolean",
-          description: "Keep the call open after the user's reply for a live conversation: answer with phone_reply. Use when the user may want to talk it through.",
-        },
-        realtime: {
-          type: "boolean",
-          description:
-            "Experimental: a fast realtime voice (OpenAI gpt-live-1) talks with the user and hands their requests to you as channel events; " +
-            "answer each with phone_reply. Needs a claude-phone session (and OPENAI_API_KEY for the openai engine). " +
-            "Omit it to use the configured default: on when realtime is set up (CALL_ME_REALTIME=1 or CALL_ME_REALTIME_ENGINE in the config) " +
-            "and wait_for_reply isn't false, otherwise off. Pass true or false only to override that, e.g. when the user asks for one kind of call.",
-        },
         engine: {
           type: "string",
-          enum: ["openai", "relay"],
+          enum: ["relay", "openai"],
           description:
-            'Realtime voice: "openai" (gpt-live-1, instant small talk, English accent in Polish) or "relay" (Twilio ConversationRelay: ' +
-            "natural Polish voice, every sentence goes to you). Default: CALL_ME_REALTIME_ENGINE or openai.",
+            'The voice: "relay" (Twilio ConversationRelay, natural voice, every sentence goes to you; the default unless CALL_ME_REALTIME_ENGINE says otherwise) ' +
+            'or "openai" (OpenAI gpt-live-1 talks and hands requests to you; needs OPENAI_API_KEY; English accent in Polish).',
         },
         language: {
           type: "string",
@@ -803,26 +605,25 @@ const TOOLS = [
   {
     name: "phone_reply",
     description:
-      "Live phone conversation: say your next line to a user who is still on the line (call_sid from a live channel event or from call_me with stay_on_line) " +
-      "and return what they say back. The user hears 'one moment' while you work, and the call ends after about 2 minutes on hold, " +
-      "so reply quickly. Keep lines short and speakable, in the call's language. Finish with end_call: true. " +
-      "If a task will take longer than a minute, say so, end the call, and call_me them when done.",
+      "Say your next line on a call (call_sid from call_me or from a channel event). Returns at once; the user's next sentence " +
+      "arrives as a new channel event. Reply within seconds; for longer work first say you're on it, then send progress updates and the result. " +
+      "Keep lines short and speakable, in the call's language. End the call with end_call: true. " +
+      "If a task will take more than a few minutes, say you'll call back, end the call, and call_me them when done.",
     inputSchema: {
       type: "object",
       properties: {
-        call_sid: { type: "string", description: "The live call's CallSid." },
+        call_sid: { type: "string", description: "The call's CallSid." },
         message: { type: "string", description: "What to say. Plain spoken sentences." },
         end_call: { type: "boolean", description: "Say the message, then hang up (default false).", default: false },
-        timeout_seconds: { type: "number", description: "Max seconds to wait for the user's answer (default 120).", default: 120 },
         exact: {
           type: "boolean",
-          description: "Realtime calls: have the voice say the message word for word (warnings, refusals, numbers). Default: it may phrase it naturally.",
+          description: "OpenAI voice: say the message word for word (warnings, refusals, numbers). The relay voice always says it word for word.",
         },
         voice: {
           type: "string",
           description:
-            'ConversationRelay calls: switch the voice from this line on, as "Provider:VoiceId", e.g. "Google:pl-PL-Chirp3-HD-Charon", ' +
-            '"Google:pl-PL-Chirp3-HD-Aoede", "Amazon:Ola-Neural", "ElevenLabs:W0sqKm1Sfw1EzlCH14FQ" (the Polish default).',
+            'ConversationRelay calls: switch the voice from this line on, as "Provider:VoiceId", e.g. "Amazon:Ola-Neural", ' +
+            '"Google:pl-PL-Chirp3-HD-Aoede", "ElevenLabs:W0sqKm1Sfw1EzlCH14FQ" (the Polish default).',
         },
       },
       required: ["call_sid", "message"],
@@ -867,14 +668,13 @@ const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
 
 const CHANNEL_INSTRUCTIONS =
   'Events in <channel source="call-me"> tags are the user talking to you over the phone (speech-to-text, so expect ' +
-  "transcription errors). Treat them as a request typed by the user. The user is away from the screen: when you finish, " +
-  "or if you need a decision, phone them back with the call_me tool, in the language they spoke (meta language). " +
-  'When meta live="true" the user is still on the line, on hold: answer right away with phone_reply(call_sid, ...), ' +
-  "which returns their next sentence, and keep the conversation going; end it with end_call: true. For work that takes more " +
-  "than about a minute (such as handing a task to another session), say you will call back, end the call, then use call_me. " +
-  'When meta realtime="true", a separate fast voice is talking with the user and handed you this request: phone_reply returns at once, ' +
-  "and the next request comes as a new event. Answer within seconds; for longer work first send a short status (\"on it\"), " +
-  "then progress updates and the result, each with phone_reply. Use exact: true for warnings, refusals and numbers.";
+  "transcription errors). Treat them as a request typed by the user. When meta live=\"true\" the user is on the line: " +
+  "answer right away with phone_reply(call_sid, ...), which returns at once; their next sentence comes as a new event. " +
+  "Answer within seconds; for longer work first say you're on it, then send progress updates and the result, each with phone_reply. " +
+  "A sentence may arrive cut in half when the user pauses: if it looks unfinished, wait for the next event instead of answering. " +
+  "End the call with end_call: true when the user says goodbye. For work that takes more than a few minutes, say you will call back, " +
+  "end the call, then use call_me. When live=\"false\" the call has ended and the event carries its transcript. " +
+  "Reply in the language the user spoke (meta language).";
 
 async function handle(msg) {
   const { id, method, params } = msg;

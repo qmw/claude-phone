@@ -5,6 +5,10 @@ import http from "node:http";
 import { EventEmitter } from "node:events";
 import { acceptUpgrade, connect } from "../plugins/call-me/server/ws.mjs";
 import { RealtimeCall, voiceInstructions } from "../plugins/call-me/server/realtime.mjs";
+import { speechProfile } from "../plugins/call-me/server/lib.mjs";
+
+const PL = speechProfile({}, "pl-PL");
+const EN = speechProfile({}, "en-US");
 
 const until = async (pred, ms = 3000) => {
   const end = Date.now() + ms;
@@ -55,7 +59,7 @@ test("realtime call: audio both ways, hand-off to Claude, answer spoken, hang-up
   const rest = [];
   const rt = new RealtimeCall({
     cfg: { OPENAI_API_KEY: "sk-test", CALL_ME_REALTIME_URL: `ws://127.0.0.1:${server.address().port}` },
-    language: "pl-PL",
+    profile: PL,
     opening: "Cześć, test.",
     project: "demo",
     notify: (method, params) => events.push(params),
@@ -110,7 +114,7 @@ test("realtime call: audio both ways, hand-off to Claude, answer spoken, hang-up
 test("realtime call: when the caller hangs up, the session gets the transcript", async () => {
   const events = [];
   const tw = Object.assign(new EventEmitter(), { send() {}, close() {} });
-  const rt = new RealtimeCall({ cfg: {}, language: "en-US", opening: "Hi", project: "p", notify: (m, p) => events.push(p), log: () => {} });
+  const rt = new RealtimeCall({ cfg: {}, profile: EN, opening: "Hi", project: "p", notify: (m, p) => events.push(p), log: () => {} });
   rt.attachTwilio(tw);
   rt.callSid = "CA2";
   rt.add("caller", "Thanks, bye");
@@ -128,18 +132,23 @@ test("voice instructions keep the voice from inventing and from taking secrets",
 
 test("relay: TwiML asks for Polish, smart interruptions and our socket", async () => {
   const { relayTwiml } = await import("../plugins/call-me/server/relay.mjs");
-  const x = relayTwiml({ url: "wss://h/relay/abc", language: "pl-PL", greeting: "Cześć & witaj", cfg: { CALL_ME_RELAY_VOICE: "pl-PL-Chirp3-HD-Aoede", CALL_ME_RELAY_TTS: "Google" } });
+  const cfg = { CALL_ME_LANGUAGE: "pl-PL", CALL_ME_RELAY_VOICE: "pl-PL-Chirp3-HD-Aoede", CALL_ME_RELAY_TTS: "Google" };
+  const x = relayTwiml({ url: "wss://h/relay/abc", profile: speechProfile(cfg), greeting: "Cześć & witaj", cfg });
   assert.match(x, /<Connect><ConversationRelay url="wss:\/\/h\/relay\/abc" language="pl-PL" welcomeGreeting="Cześć &amp; witaj"/);
   assert.match(x, /interruptSensitivity="high" ignoreBackchannel="false" transcriptionProvider="Deepgram" speechModel="nova-3-general"/);
   assert.match(x, /ttsProvider="Google" voice="pl-PL-Chirp3-HD-Aoede"/);
-  assert.doesNotMatch(relayTwiml({ url: "wss://h", language: "pl-PL", greeting: "x", cfg: {} }), /ttsProvider|voice=/);
+  assert.doesNotMatch(relayTwiml({ url: "wss://h", profile: PL, greeting: "x", cfg: {} }), /ttsProvider|voice=/);
+  // The Polish voice is not used for an English call.
+  const en = relayTwiml({ url: "wss://h", profile: speechProfile(cfg, "en-US"), greeting: "x", cfg });
+  assert.match(en, /language="en-US"/);
+  assert.doesNotMatch(en, /Aoede|ttsProvider/);
 });
 
-test("relay: caller's sentence reaches Claude, filler while waiting, answer spoken, hang-up", async () => {
+test("relay: caller's sentence reaches Claude, quiet while waiting, answer spoken, hang-up", async () => {
   const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
   const out = [], events = [], rest = [];
   const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
-  const rc = new RelayCall({ cfg: {}, language: "pl-PL", opening: "Cześć", notify: (m, p) => events.push(p), log: () => {}, twilio: async (...a) => rest.push(a) });
+  const rc = new RelayCall({ cfg: {}, profile: PL, opening: "Cześć", notify: (m, p) => events.push(p), log: () => {}, twilio: async (...a) => rest.push(a) });
   rc.attach(ws);
   ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA9" }));
   assert.ok(rc.ready);
@@ -148,12 +157,12 @@ test("relay: caller's sentence reaches Claude, filler while waiting, answer spok
   ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Jaka jest wersja pluginu?", last: true }));
   assert.match(events[0].content, /^Jaka jest wersja pluginu\?/);
   assert.equal(events[0].meta.call_sid, "CA9");
-  await until(() => out.length === 1, 4000); // filler after 2.5 s
-  assert.equal(out[0].token, "Chwileczkę.");
+  await new Promise((r) => setTimeout(r, 3000)); // no filler by default
+  assert.equal(out.length, 0);
   assert.match(rc.say("Wersja zero osiem."), /^Said/);
-  assert.deepEqual(out[1], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
+  assert.deepEqual(out[0], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
   await rc.hangup();
-  assert.equal(out[2].type, "end");
+  assert.equal(out[1].type, "end");
   assert.deepEqual(rest[0].slice(1), ["POST", "Calls/CA9.json", { Status: "completed" }]);
   assert.equal(events.length, 1);
 });
@@ -162,7 +171,7 @@ test("relay: the voice can change mid-call", async () => {
   const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
   const out = [];
   const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
-  const rc = new RelayCall({ cfg: {}, language: "pl-PL", opening: "x", notify() {}, log() {} });
+  const rc = new RelayCall({ cfg: {}, profile: PL, opening: "x", notify() {}, log() {} });
   rc.attach(ws);
   rc.say("Tu głos Charon.", { voice: "Google:pl-PL-Chirp3-HD-Charon" });
   assert.deepEqual(out[0], { type: "language", ttsLanguage: "pl-PL", ttsProvider: "Google", voice: "pl-PL-Chirp3-HD-Charon" });
@@ -183,4 +192,32 @@ test("ws: a reset connection does not throw", async () => {
   c.socket.destroy(new Error("reset"));
   await until(() => closed);
   server.close();
+});
+
+test("relay: an optional filler word, and 'still working' after 25 s", async () => {
+  const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
+  const out = [];
+  const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
+  const rc = new RelayCall({ cfg: { CALL_ME_RELAY_FILLER: "Mhm." }, profile: PL, opening: "x", notify() {}, log() {} });
+  rc.attach(ws);
+  ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA7" }));
+  ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Co tam?", last: true }));
+  await until(() => out.length === 1, 4000);
+  assert.equal(out[0].token, "Mhm.");
+  rc.waiting.stillAt = Date.now() - 1;
+  await until(() => out.length === 2, 2000);
+  assert.equal(out[1].token, "Nadal nad tym pracuję.");
+  rc.end("test");
+});
+
+test("relay: a one-way call tells the session nothing", async () => {
+  const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
+  const events = [];
+  const ws = Object.assign(new EventEmitter(), { send() {}, close() {} });
+  const rc = new RelayCall({ cfg: {}, profile: PL, opening: "Gotowe.", quiet: true, notify: (m, p) => events.push(p), log() {} });
+  rc.attach(ws);
+  ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA8" }));
+  ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Dzięki", last: true }));
+  ws.emit("close");
+  assert.equal(events.length, 0);
 });

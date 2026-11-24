@@ -29,8 +29,8 @@ export function voiceInstructions({ language, opening, project, ownerName }) {
 
 /** One realtime call. Created when Twilio opens the media stream for it. */
 export class RealtimeCall {
-  constructor({ cfg, language, opening, project, voice, notify, log, twilio, onEnd }) {
-    Object.assign(this, { cfg, language, opening, project, notify, log, twilio, onEnd });
+  constructor({ cfg, profile, opening, project, voice, notify, log, twilio, onEnd }) {
+    Object.assign(this, { cfg, profile, language: profile.language, opening, project, notify, log, twilio, onEnd });
     this.voice = voice || cfg.CALL_ME_REALTIME_VOICE || "marin";
     this.callSid = null;
     this.streamSid = null;
@@ -98,6 +98,7 @@ export class RealtimeCall {
     switch (m.type) {
       case "session.started":
         this.ready = true;
+        this.readyAt = Date.now();
         this.log(`realtime voice ready for ${this.callSid}`);
         break;
       case "session.output_audio.delta":
@@ -190,13 +191,14 @@ export class RealtimeCall {
     return "Sent to the voice, which says it now. The caller's next request will arrive as a new channel event (realtime=\"true\").";
   }
 
-  async hangup() {
+  /** End the call. The session gets no transcript (it ended the call itself, or it was voicemail). */
+  async hangup(reason = "Claude ended the call") {
     if (this.ended) return;
     if (this.callSid) await this.twilio(this.cfg, "POST", `Calls/${this.callSid}.json`, { Status: "completed" }).catch(() => {});
-    this.end("Claude ended the call");
+    this.end(reason, { silent: true });
   }
 
-  end(reason) {
+  end(reason, { silent = false } = {}) {
     if (this.ended) return;
     this.ended = reason;
     clearInterval(this.timer);
@@ -207,7 +209,7 @@ export class RealtimeCall {
     this.tw?.close();
     this.log(`realtime call ${this.callSid} ended: ${reason}`);
     const transcript = this.transcript.map((t) => `${t.who === "caller" ? "Caller" : "Voice"}: ${t.text.trim()}`).join("\n");
-    if (reason !== "Claude ended the call")
+    if (!silent)
       this.notify("notifications/claude/channel", {
         content: `The realtime call has ended (${reason}). Transcript:\n${transcript || "(nothing was said)"}`,
         meta: { live: "false", realtime: "true", call_sid: this.callSid || "", language: this.language },

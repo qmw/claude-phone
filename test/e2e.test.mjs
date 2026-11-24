@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { twilioSignature } from "../plugins/call-me/server/lib.mjs";
+import { connect } from "../plugins/call-me/server/ws.mjs";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const TOKEN = "tok";
@@ -64,18 +65,73 @@ async function webhook(path, params, { sign = true } = {}) {
   return { status: res.status, body: await res.text() };
 }
 
-test("inbound calls reach the session as channel events; outbound honours per-call language", async () => {
-  const s = startServer();
+
+const INIT = { id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Start the server, take over the number, and return helpers. */
+async function ready(extraEnv) {
+  const s = startServer(extraEnv);
+  s.send(INIT);
+  await s.until(() => s.stdout.some((m) => m.id === 1));
+  s.send({ method: "notifications/initialized" });
+  if (extraEnv?.CALL_ME_INBOUND !== "") await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+  let id = 100;
+  s.tool = (name, args) => {
+    const n = ++id;
+    s.send({ id: n, method: "tools/call", params: { name, arguments: args } });
+    return async (ms = 15000) => {
+      await s.until(() => s.stdout.some((m) => m.id === n), ms);
+      const r = s.stdout.find((m) => m.id === n).result;
+      return r.isError ? `ERROR ${r.content[0].text}` : r.content[0].text;
+    };
+  };
+  s.created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
+  s.events = () => s.stdout.filter((m) => m.method === "notifications/claude/channel").map((m) => m.params);
+  return s;
+}
+
+/** Act as Twilio ConversationRelay for a TwiML document: open its socket and send setup. */
+async function relay(twiml, callSid) {
+  const ws = await connect(twiml.match(/<ConversationRelay url="([^"]+)"/)[1]);
+  const said = [];
+  ws.on("message", (m) => said.push(JSON.parse(m)));
+  ws.send({ type: "setup", callSid });
+  ws.said = said;
+  ws.prompt = (text) => ws.send({ type: "prompt", voicePrompt: text, last: true });
+  return ws;
+}
+
+/** The n-th outbound call (1-based) is picked up: ConversationRelay connects and detection reports `answeredBy`. */
+async function pickUp(s, n, answeredBy = "human", before) {
+  await s.until(() => s.created().length >= n, 10000);
+  const form = s.created()[n - 1].form;
+  const ws = await relay(form.Twiml, `CA${n}`);
+  await before?.(ws);
+  if (answeredBy) {
+    await wait(100);
+    const amdPath = form.AsyncAmdStatusCallback.slice(BASE.length);
+    assert.equal((await webhook(amdPath, { CallSid: `CA${n}`, AnsweredBy: answeredBy })).status, 200);
+  }
+  return ws;
+}
+
+const until = async (pred, ms = 5000) => {
+  for (const end = Date.now() + ms; !pred(); await wait(20)) if (Date.now() > end) throw new Error("timed out");
+};
+
+test("inbound: number taken over, strangers rejected, the caller talks with the session, number released on exit", async () => {
+  const s = await ready({ CALL_ME_RELAY_TTS: "Amazon", CALL_ME_RELAY_VOICE: "Ola-Neural" });
   try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    await s.until(() => s.stdout.some((m) => m.id === 1));
     const init = s.stdout.find((m) => m.id === 1).result;
     assert.deepEqual(init.capabilities.experimental, { "claude/channel": {} });
-    assert.match(init.instructions, /call_me/);
+    assert.match(init.instructions, /phone_reply/);
+    s.send({ id: 9, method: "tools/list" });
+    await s.until(() => s.stdout.some((m) => m.id === 9));
+    const tools = s.stdout.find((m) => m.id === 9).result.tools;
+    assert.deepEqual(tools.map((t) => t.name), ["call_me", "phone_reply", "call_me_settings"]);
+    assert.ok(!("realtime" in tools[0].inputSchema.properties) && !("stay_on_line" in tools[0].inputSchema.properties));
 
-    // Taking over the number.
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
     const claim = s.twilio.find((r) => r.form.VoiceUrl);
     assert.equal(claim.form.VoiceUrl, `${BASE}/incoming`);
     assert.match(claim.form.VoiceFallbackUrl, /^https:\/\/twimlets\.com\/echo\?Twiml=/);
@@ -84,36 +140,32 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
     assert.equal((await webhook("/incoming", { From: ME }, { sign: false })).status, 403);
     assert.match((await webhook("/incoming", { From: "+15550001111", CallSid: "CAx" })).body, /<Reject\/>/);
 
-    // The user calls and speaks.
-    const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
-    assert.match(answer.body, /<Gather input="speech" action="http:\/\/127\.0\.0\.1:\d+\/incoming\/gather"[^>]*language="pl-PL"/);
-    const done = await webhook("/incoming/gather", { From: ME, CallSid: "CAin", SpeechResult: "Odpal testy", Confidence: "0.93" });
-    assert.match(done.body, /<Redirect method="POST">http:\/\/127\.0\.0\.1:\d+\/live\/wait<\/Redirect>/);
-    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
-    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
-    assert.equal(ev.content, "Odpal testy");
-    assert.deepEqual(ev.meta, {
-      live: "true", from: ME, to: "+17250000000", machine: "laptop", language: "pl-PL", confidence: "0.93", call_sid: "CAin", saved_messages: "0", saved_messages_heard: "0",
-    });
+    const twiml = (await webhook("/incoming", { From: ME, To: "+17250000000", CallSid: "CAin" })).body;
+    assert.match(twiml, /<ConversationRelay url="ws:\/\/127\.0\.0\.1:\d+\/relay\/[a-f0-9]{32}" language="pl-PL" welcomeGreeting="Cześć, tu Claude\. Słucham\."/);
+    assert.match(twiml, /ttsProvider="Amazon" voice="Ola-Neural"/);
+    const ws = await relay(twiml, "CAin");
+    ws.prompt("Odpal testy");
+    await s.until(() => s.events().length === 1);
+    const ev = s.events()[0];
+    assert.match(ev.content, /^Odpal testy/);
+    assert.deepEqual(
+      [ev.meta.live, ev.meta.realtime, ev.meta.direction, ev.meta.from, ev.meta.machine, ev.meta.call_sid, ev.meta.saved_messages],
+      ["true", "true", "inbound", ME, "laptop", "CAin", "0"],
+    );
+
+    // Quiet while Claude works: no filler word.
+    await wait(3000);
+    assert.equal(ws.said.length, 0);
+    assert.match(await s.tool("phone_reply", { call_sid: "CAin", message: "Testy przeszły." })(), /^Said/);
+    await until(() => ws.said.some((m) => m.token === "Testy przeszły."));
+    assert.match(await s.tool("phone_reply", { call_sid: "CAin", message: "Pa!", end_call: true })(), /hangs up/);
+    assert.match(await s.tool("phone_reply", { call_sid: "CAnone", message: "x" })(), /ERROR.*No call CAnone/);
 
     // A second phone on the allow-list gets through too.
-    assert.match((await webhook("/incoming", { From: "+48600000001", CallSid: "CAin2" })).body, /<Gather/);
-
-    // Outbound call in English although the default is Polish.
-    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Tests passed.", language: "en-US" } } });
-    await s.until(() => s.twilio.some((r) => r.form.Twiml));
-    const twiml = s.twilio.find((r) => r.form.Twiml).form.Twiml;
-    assert.match(twiml, /voice="Polly\.Joanna" language="en-US">Hi, this is Claude\./);
-    const action = twiml.match(/action="([^"]+)"/)[1];
-    const ack = await webhook(new URL(action).pathname, { SpeechResult: "great", Confidence: "0.9" });
-    assert.match(ack.body, /Got it, thanks/);
-    await s.until(() => s.stdout.some((m) => m.id === 2));
-    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /User replied by voice: "great"/);
+    assert.match((await webhook("/incoming", { From: "+48600000001", CallSid: "CAin2" })).body, /<ConversationRelay/);
 
     // Unsupported language fails before dialing.
-    s.send({ id: 3, method: "tools/call", params: { name: "call_me", arguments: { message: "x", language: "de" } } });
-    await s.until(() => s.stdout.some((m) => m.id === 3));
-    assert.equal(s.stdout.find((m) => m.id === 3).result.isError, true);
+    assert.match(await s.tool("call_me", { message: "x", language: "de" })(), /ERROR/);
 
     // Closing the session hands the number back to the offline message.
     const exited = new Promise((r) => s.proc.on("exit", r));
@@ -127,112 +179,100 @@ test("inbound calls reach the session as channel events; outbound honours per-ca
   }
 });
 
-test("retries unanswered calls, stops on rejection, holds calls until the user calls back", async () => {
-  const s = startServer({
-    FAKE_CALLS: "no-answer;in-progress:machine_start;completed:human:12",
-    CALL_ME_RETRY_DELAY: "0.1",
-    CALL_ME_READ_SAVED: "1",
-  });
-  const result = async (id) => {
-    await s.until(() => s.stdout.some((m) => m.id === id), 15000);
-    return s.stdout.find((m) => m.id === id).result.content[0].text;
-  };
-  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
+test("outbound conversation: the message is said on pick-up, the user's words reach the session, English uses no Polish voice", async () => {
+  const s = await ready({ CALL_ME_RELAY_TTS: "Amazon", CALL_ME_RELAY_VOICE: "Ola-Neural" });
   try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+    const result = s.tool("call_me", { message: "Testy padły. Naprawić?", retries: 0 });
+    const ws = await pickUp(s, 1);
+    assert.match(await result(), /picked up and is hearing your message \(call CA1\)/);
+    const form = s.created()[0].form;
+    assert.match(form.Twiml, /welcomeGreeting="Testy padły\. Naprawić\?"[^>]*ttsProvider="Amazon" voice="Ola-Neural"/);
+    assert.equal(form.AsyncAmd, "true");
+    ws.prompt("Tak, napraw");
+    await s.until(() => s.events().length === 1);
+    assert.equal(s.events()[0].meta.call_sid, "CA1");
+    s.tool("phone_reply", { call_sid: "CA1", message: "Naprawiam." });
+    await until(() => ws.said.some((m) => m.token === "Naprawiam."));
 
-    // 1st attempt rings out, 2nd hits voicemail (= rejected): no 3rd attempt, voicemail hung up.
-    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Build failed.", wait_for_reply: false } } });
-    assert.match(await result(2), /REJECTED/);
-    assert.equal(created().length, 2);
-    assert.equal(created()[0].form.MachineDetection, "Enable");
-    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA2.json") && r.form.Status === "completed"));
+    // The user hangs up: the session gets the transcript.
+    ws.close();
+    await s.until(() => s.events().length === 2);
+    assert.match(s.events()[1].content, /has ended \(the caller hung up\)[\s\S]*Caller: Tak, napraw/);
 
-    // Do-not-disturb: the next call is only saved, unless forced.
-    s.send({ id: 3, method: "tools/call", params: { name: "call_me", arguments: { message: "Second thing.", language: "en-US" } } });
-    assert.match(await result(3), /Not called/);
-    assert.equal(created().length, 2);
-
-    // The user calls back: both saved messages are read, each in its language, then the session is notified.
-    const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
-    assert.match(answer.body, /Zapisane wiadomości: 2\./);
-    assert.match(answer.body, /language="pl-PL">Z projektu [^<]+: Build failed\./);
-    assert.match(answer.body, /voice="Polly\.Joanna" language="en-US">From [^<]+: Second thing\./);
-    assert.match(answer.body, /actionOnEmptyResult="true"/);
-    await webhook("/incoming/gather", { From: ME, CallSid: "CAin", SpeechResult: "Napraw build" });
-    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
-    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
-    assert.match(ev.content, /^Napraw build\n\nBefore speaking, the user heard/);
-    assert.match(ev.content, /Build failed\.[\s\S]*Second thing\./);
-    assert.equal(ev.meta.saved_messages_heard, "2");
-
-    // Calling back ended do-not-disturb: calls go through again.
-    s.send({ id: 4, method: "tools/call", params: { name: "call_me", arguments: { message: "Fixed.", wait_for_reply: false } } });
-    assert.match(await result(4), /message was delivered/);
-    assert.equal(created().length, 3);
-
-    // A second callback has nothing saved any more.
-    assert.doesNotMatch((await webhook("/incoming", { From: ME, CallSid: "CAin2" })).body, /Zapisane/);
+    // English call: English recognition, no Polish voice.
+    s.tool("call_me", { message: "Done.", language: "en-US", retries: 0 });
+    await s.until(() => s.created().length === 2);
+    const en = s.created()[1].form.Twiml;
+    assert.match(en, /language="en-US"/);
+    assert.doesNotMatch(en, /Ola-Neural/);
   } finally {
     s.proc.kill();
   }
 });
 
-test("live conversation: inbound and outbound calls stay open for phone_reply", async () => {
-  const s = startServer({ CALL_ME_LIVE_HOLD: "60" });
-  const result = async (id) => {
-    await s.until(() => s.stdout.some((m) => m.id === id), 10000);
-    return s.stdout.find((m) => m.id === id).result.content[0].text;
-  };
+test("retries unanswered calls, hangs up on voicemail without telling the session what it heard, holds calls until the user calls back", async () => {
+  const s = await ready({ FAKE_CALLS: "no-answer;in-progress", CALL_ME_RETRY_DELAY: "0.1" });
   try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    await s.until(() => s.stdout.some((m) => m.id === 1));
-    s.send({ id: 9, method: "tools/list" });
-    await s.until(() => s.stdout.some((m) => m.id === 9));
-    assert.deepEqual(s.stdout.find((m) => m.id === 9).result.tools.map((t) => t.name), ["call_me", "phone_reply", "call_me_settings"]);
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
+    // 1st attempt rings out, 2nd reaches voicemail (= rejected): no 3rd attempt, voicemail hung up.
+    const r1 = s.tool("call_me", { message: "Build failed." });
+    await pickUp(s, 2, "machine_start", async (ws) => {
+      ws.prompt("Leave a message after the tone");
+      await wait(200);
+    });
+    assert.match(await r1(), /REJECTED/);
+    assert.equal(s.created().length, 2);
+    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA2.json") && r.form.Status === "completed"));
+    assert.equal(s.events().length, 0, "the voicemail greeting must not reach the session");
 
-    // Inbound: the user speaks and is put on hold.
-    await webhook("/incoming", { From: ME, CallSid: "CAlive" });
-    const hold = await webhook("/incoming/gather", { From: ME, CallSid: "CAlive", SpeechResult: "Jaka pogoda?" });
-    assert.match(hold.body, /<Pause length="2"\/><Redirect/);
-    assert.doesNotMatch(hold.body, /<Say/);
-    // Nothing to say yet: keep holding.
-    assert.match((await webhook("/live/wait", { CallSid: "CAlive" })).body, /<Redirect/);
+    // Do-not-disturb: the next call is only saved, unless forced.
+    assert.match(await s.tool("call_me", { message: "Second thing.", language: "en-US" })(), /Not called/);
+    assert.equal(s.created().length, 2);
 
-    // Claude answers; Twilio's next poll speaks it and listens.
-    s.send({ id: 2, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "Słonecznie. Coś jeszcze?" } } });
-    let turn;
-    for (let i = 0; i < 20 && !/Gather/.test((turn = (await webhook("/live/wait", { CallSid: "CAlive" })).body)); i++) await new Promise((r) => setTimeout(r, 50));
-    assert.match(turn, /<Gather input="speech dtmf" action="http:\/\/127\.0\.0\.1:\d+\/live\/gather"[^>]*><\/Gather>/);
-    assert.match(turn, /<Say[^>]*>Słonecznie\. Coś jeszcze\?<\/Say><Gather/);
-    assert.match((await webhook("/live/gather", { CallSid: "CAlive", SpeechResult: "Nie, dzięki" })).body, /<Redirect/);
-    assert.match(await result(2), /User said: "Nie, dzięki"/);
+    // The user calls back: the saved messages go to the session with the first sentence, not read aloud.
+    const twiml = (await webhook("/incoming", { From: ME, CallSid: "CAin" })).body;
+    assert.doesNotMatch(twiml, /Build failed/);
+    const ws = await relay(twiml, "CAin");
+    ws.prompt("Napraw build");
+    await s.until(() => s.events().length === 1);
+    const ev = s.events()[0];
+    assert.match(ev.content, /^Napraw build[\s\S]*Saved messages[^\n]*NOT heard[\s\S]*Build failed\.[\s\S]*Second thing\./);
+    assert.equal(ev.meta.saved_messages, "2");
+    ws.close();
 
-    // Claude ends the call.
-    s.send({ id: 3, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "Pa!", end_call: true } } });
-    let bye;
-    for (let i = 0; i < 20 && !/Hangup/.test((bye = (await webhook("/live/wait", { CallSid: "CAlive" })).body)); i++) await new Promise((r) => setTimeout(r, 50));
-    assert.match(bye, /Pa!<\/Say><Hangup\/>/);
-    assert.match(await result(3), /Said it and hung up/);
-    s.send({ id: 4, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CAlive", message: "x" } } });
-    assert.match(await result(4), /No live call/);
+    // Calling back ended do-not-disturb: a one-way notice goes through, plays, and hangs up; the session hears nothing.
+    const r2 = s.tool("call_me", { message: "Fixed.", wait_for_reply: false });
+    const ws3 = await pickUp(s, 3);
+    ws3.prompt("Dzięki");
+    assert.match(await r2(), /message was delivered/);
+    assert.match(s.created()[2].form.Twiml, /welcomeGreeting="Fixed\."/);
+    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA3.json") && r.form.Status === "completed"));
+    await wait(200);
+    assert.equal(s.events().length, 2); // the transcript of the callback only
+  } finally {
+    s.proc.kill();
+  }
+});
 
-    // Outbound with stay_on_line: after the reply the call is held instead of hung up.
-    s.send({ id: 5, method: "tools/call", params: { name: "call_me", arguments: { message: "Testy padły.", stay_on_line: true } } });
-    await s.until(() => s.twilio.some((r) => r.form.Twiml));
-    const action = s.twilio.find((r) => r.form.Twiml).form.Twiml.match(/action="([^"]+)"/)[1];
-    assert.match((await webhook(new URL(action).pathname, { CallSid: "CA1", SpeechResult: "Które?" })).body, /<Redirect/);
-    assert.match(await result(5), /User replied by voice: "Które\?".*still on the line.*phone_reply \(call_sid "CA1"\)/);
+test("backup phones are tried in order when the main one doesn't pick up, and may call in", async () => {
+  const s = await ready({ FAKE_CALLS: "no-answer;in-progress", CALL_ME_BACKUP_NUMBERS: "+48500000007,+48500000008", CALL_ME_ALLOWED_CALLERS: "" });
+  try {
+    const r = s.tool("call_me", { message: "Done.", wait_for_reply: false });
+    await pickUp(s, 2);
+    assert.match(await r(), /delivered\. \(call CA2, to \+48500000007, a backup phone\)/);
+    assert.deepEqual(s.created().map((c) => c.form.To), [ME, "+48500000007"]);
+    assert.match((await webhook("/incoming", { From: "+48500000008", CallSid: "CAb" })).body, /<ConversationRelay/);
+    assert.match((await webhook("/incoming", { From: "+48500000009", CallSid: "CAx" })).body, /<Reject/);
+  } finally {
+    s.proc.kill();
+  }
+});
 
-    // Silence after Claude's line ends the call.
-    s.send({ id: 6, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CA1", message: "Dwa testy e2e." } } });
-    for (let i = 0; i < 20 && !/Gather/.test((await webhook("/live/wait", { CallSid: "CA1" })).body); i++) await new Promise((r) => setTimeout(r, 50));
-    assert.match((await webhook("/live/gather", { CallSid: "CA1" })).body, /Nie otrzymałem odpowiedzi.*<Hangup\/>/);
-    assert.match(await result(6), /said nothing/);
+test("a session not started with claude-phone can still deliver a message, but says it couldn't listen", async () => {
+  const s = await ready({ CALL_ME_INBOUND: "" });
+  try {
+    const r = s.tool("call_me", { message: "Gotowe.", retries: 0 });
+    await pickUp(s, 1);
+    assert.match(await r(), /delivered.*claude-phone/);
   } finally {
     s.proc.kill();
   }
@@ -242,31 +282,18 @@ test("call_me_settings: each session/project picks its own numbers and answers i
   const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "cm-cfg-"));
   // Numbers come from the machine config file here (environment variables would override project settings).
   fs.writeFileSync(path.join(cfgDir, "config.env"), `TWILIO_FROM_NUMBER=+17250000000\nCALL_ME_TO_NUMBER=${ME}\n`);
-  const s = startServer({ CALL_ME_CONFIG: path.join(cfgDir, "config.env"), CALL_ME_ALLOWED_CALLERS: "", TWILIO_FROM_NUMBER: "", CALL_ME_TO_NUMBER: "" });
-  let id = 10;
+  const s = await ready({ CALL_ME_CONFIG: path.join(cfgDir, "config.env"), CALL_ME_ALLOWED_CALLERS: "", TWILIO_FROM_NUMBER: "", CALL_ME_TO_NUMBER: "" });
   const settings = async (args) => {
-    const n = ++id;
-    s.send({ id: n, method: "tools/call", params: { name: "call_me_settings", arguments: args } });
-    await s.until(() => s.stdout.some((m) => m.id === n), 10000);
-    const r = s.stdout.find((m) => m.id === n).result;
-    return { text: r.content[0].text, error: !!r.isError };
+    const t = await s.tool("call_me_settings", args)();
+    return { text: t, error: t.startsWith("ERROR") };
   };
   const voiceUrls = () => s.twilio.filter((r) => r.form.VoiceUrl);
   try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    await s.until(() => s.stdout.some((m) => m.id === 1));
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => voiceUrls().length === 1);
     assert.match(voiceUrls()[0].path, /PN1\.json$/);
-
-    // Show current settings.
     assert.match((await settings({})).text, /from_number[^:]*: \+17250000000[\s\S]*answer_calls: yes, answering \+17250000000/);
-
-    // Unknown Twilio number and malformed numbers are refused.
     assert.match((await settings({ from_number: "+17259999999" })).text, /not a number on this Twilio account/);
     assert.ok((await settings({ to_number: "12345" })).error);
 
-    // Switch this project to the second number: release PN1, take over PN2; save to the project file.
     const r = await settings({ from_number: "+1 725 000 0002", to_number: "+48600000009", allowed_callers: ["+48600000010"] });
     assert.match(r.text, /Stopped answering \+17250000000[\s\S]*Now answering calls to \+17250000002/);
     const [release, claim] = voiceUrls().slice(-2);
@@ -280,133 +307,18 @@ test("call_me_settings: each session/project picks its own numbers and answers i
     assert.match(saved, /CALL_ME_TO_NUMBER="\+48600000009"/);
     assert.equal(fs.statSync(path.join(cfgDir, "projects", projectFiles[0])).mode & 0o777, 0o600);
 
-    // The new caller list applies at once: the new to_number and allowed caller get through, the old phone does not.
-    assert.match((await webhook("/incoming", { From: "+48600000010", CallSid: "CAa" })).body, /<Gather/);
-    assert.match((await webhook("/incoming", { From: "+48600000009", CallSid: "CAb" })).body, /<Gather/);
+    assert.match((await webhook("/incoming", { From: "+48600000010", CallSid: "CAa" })).body, /<ConversationRelay/);
+    assert.match((await webhook("/incoming", { From: "+48600000009", CallSid: "CAb" })).body, /<ConversationRelay/);
     assert.match((await webhook("/incoming", { From: ME, CallSid: "CAc" })).body, /<Reject\/>/);
 
-    // Outbound calls come from the session's number.
-    s.send({ id: 99, method: "tools/call", params: { name: "call_me", arguments: { message: "hi", wait_for_reply: false, retries: 0 } } });
-    await s.until(() => s.twilio.some((r) => r.form.Twiml));
-    const call = s.twilio.find((r) => r.form.Twiml).form;
-    assert.equal(call.From, "+17250000002");
-    assert.equal(call.To, "+48600000009");
+    s.tool("call_me", { message: "hi", wait_for_reply: false, retries: 0 });
+    await s.until(() => s.created().length === 1);
+    assert.equal(s.created()[0].form.From, "+17250000002");
+    assert.equal(s.created()[0].form.To, "+48600000009");
 
-    // Session-only change to stop answering; list numbers.
     const off = await settings({ answer_calls: false, scope: "session", list_numbers: true });
     assert.match(off.text, /answer_calls: no[\s\S]*Stopped answering \+17250000002/);
     assert.match(off.text, /\+17250000002: free \(plays the offline message\)/);
-  } finally {
-    s.proc.kill();
-  }
-});
-
-test("calls that wait for a reply detect voicemail in the background and hang up on it", async () => {
-  const s = startServer();
-  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
-  try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
-
-    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Hej.", retries: 0 } } });
-    await s.until(() => created().length === 1);
-    const form = created()[0].form;
-    assert.equal(form.MachineDetection, "Enable");
-    assert.equal(form.AsyncAmd, "true");
-    const amdPath = form.AsyncAmdStatusCallback.slice(BASE.length);
-    assert.match(amdPath, /^\/amd\/[a-f0-9]{32}$/);
-
-    // Unsigned callbacks are refused; a signed "machine" verdict hangs up and counts as a rejection.
-    assert.equal((await webhook(amdPath, { CallSid: "CA1", AnsweredBy: "machine_start" }, { sign: false })).status, 403);
-    assert.equal((await webhook(amdPath, { CallSid: "CA1", AnsweredBy: "machine_start" })).status, 200);
-    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
-    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /REJECTED/);
-    assert.ok(s.twilio.some((r) => r.path.endsWith("/Calls/CA1.json") && r.form.Status === "completed"));
-  } finally {
-    s.proc.kill();
-  }
-});
-
-test("by default saved messages are not read on the phone, only handed to the session", async () => {
-  const s = startServer({ FAKE_CALLS: "in-progress:machine_start" });
-  try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
-    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Build failed.", wait_for_reply: false } } });
-    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
-    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /REJECTED/);
-
-    const answer = await webhook("/incoming", { From: ME, CallSid: "CAin" });
-    assert.doesNotMatch(answer.body, /Zapisane|Build failed/);
-    assert.match(answer.body, /actionOnEmptyResult="true"/);
-    await webhook("/incoming/gather", { From: ME, CallSid: "CAin" });
-    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
-    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
-    assert.match(ev.content, /^\(the user said nothing\)\n\nSaved messages [^\n]*NOT heard[\s\S]*Build failed\./);
-    assert.equal(ev.meta.saved_messages, "1");
-    assert.equal(ev.meta.saved_messages_heard, "0");
-  } finally {
-    s.proc.kill();
-  }
-});
-
-test("backup phones are tried in order when the main one doesn't pick up, and may call in", async () => {
-  const s = startServer({
-    FAKE_CALLS: "no-answer;completed:human:12",
-    CALL_ME_BACKUP_NUMBERS: "+48500000007,+48500000008",
-    CALL_ME_ALLOWED_CALLERS: "",
-  });
-  const created = () => s.twilio.filter((r) => r.method === "POST" && r.path.endsWith("/Calls.json"));
-  try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
-    s.send({ id: 2, method: "tools/call", params: { name: "call_me", arguments: { message: "Done.", wait_for_reply: false } } });
-    await s.until(() => s.stdout.some((m) => m.id === 2), 10000);
-    assert.deepEqual(created().map((r) => r.form.To), [ME, "+48500000007"]);
-    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /delivered\. \(call CA2, to \+48500000007, a backup phone\)/);
-
-    // Backups may call in; strangers may not.
-    assert.doesNotMatch((await webhook("/incoming", { From: "+48500000008", CallSid: "CAb" })).body, /<Reject/);
-    assert.match((await webhook("/incoming", { From: "+48500000009", CallSid: "CAx" })).body, /<Reject/);
-  } finally {
-    s.proc.kill();
-  }
-});
-
-test("incoming calls in realtime mode: ConversationRelay, sentences reach the session, phone_reply answers", async () => {
-  const { connect } = await import("../plugins/call-me/server/ws.mjs");
-  const s = startServer({ CALL_ME_INBOUND_ENGINE: "relay", CALL_ME_RELAY_TTS: "Amazon", CALL_ME_RELAY_VOICE: "Ola-Neural" });
-  try {
-    s.send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
-    s.send({ method: "notifications/initialized" });
-    await s.until(() => s.twilio.some((r) => r.form.VoiceUrl));
-
-    assert.match((await webhook("/incoming", { From: "+48999999999", CallSid: "CAx" })).body, /<Reject/);
-    const twiml = (await webhook("/incoming", { From: ME, To: "+17250000000", CallSid: "CArt" })).body;
-    assert.match(twiml, /<ConversationRelay url="ws:\/\/127\.0\.0\.1:\d+\/relay\/[a-f0-9]{32}" language="pl-PL" welcomeGreeting="Cześć, tu Claude\. Słucham\."/);
-    assert.match(twiml, /ttsProvider="Amazon" voice="Ola-Neural"/);
-
-    const tw = await connect(twiml.match(/url="([^"]+)"/)[1]);
-    const said = [];
-    tw.on("message", (m) => said.push(JSON.parse(m)));
-    tw.send({ type: "setup", callSid: "CArt", from: ME });
-    tw.send({ type: "prompt", voicePrompt: "Sprawdź status builda", last: true });
-    await s.until(() => s.stdout.some((m) => m.method === "notifications/claude/channel"));
-    const ev = s.stdout.find((m) => m.method === "notifications/claude/channel").params;
-    assert.match(ev.content, /^Sprawdź status builda/);
-    assert.equal(ev.meta.direction, "inbound");
-    assert.equal(ev.meta.from, ME);
-    assert.equal(ev.meta.realtime, "true");
-
-    s.send({ id: 2, method: "tools/call", params: { name: "phone_reply", arguments: { call_sid: "CArt", message: "Build przeszedł." } } });
-    await s.until(() => s.stdout.some((m) => m.id === 2));
-    assert.match(s.stdout.find((m) => m.id === 2).result.content[0].text, /^Said/);
-    for (let i = 0; i < 100 && !said.some((m) => m.token === "Build przeszedł."); i++) await new Promise((r) => setTimeout(r, 20));
-    assert.ok(said.some((m) => m.token === "Build przeszedł."), JSON.stringify(said));
-    tw.close();
   } finally {
     s.proc.kill();
   }

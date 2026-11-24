@@ -43,7 +43,8 @@ const readEnvFile = (file) => {
 };
 
 /** Config = config file < project file < process env < this session's overrides. */
-const PHRASE_KEYS = ["CALL_ME_VOICE", "CALL_ME_INTRO", "CALL_ME_REPLY_PROMPT", "CALL_ME_ACK"];
+// A voice belongs to the language in effect where it was set (a Polish voice must not read an English call).
+const PHRASE_KEYS = ["CALL_ME_VOICE", "CALL_ME_RELAY_TTS", "CALL_ME_RELAY_VOICE", "CALL_ME_GREETING"];
 
 export function loadConfig(env = process.env, file = CONFIG_PATH, projectFile = null, overrides = {}) {
   const fromEnv = Object.fromEntries(
@@ -84,43 +85,20 @@ export function xmlEscape(s) {
   return String(s).replace(/[<>&'"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[c]);
 }
 
-// Spoken phrases per supported language. Claude speaks of itself in the masculine in Polish.
+// Fixed phrases per supported language. Claude speaks of itself in the masculine in Polish.
+// `voice` is the Twilio <Say> voice for the offline message; calls themselves use ConversationRelay voices.
 export const LANGUAGES = {
   "en-US": {
     voice: "Polly.Joanna",
-    intro: "Hi, this is Claude.",
-    prompt: "", // no "say your reply now": the message ends with a question, and people just answer
-    retry: "I didn't catch that.",
-    noReply: "No reply received. Goodbye.",
-    ack: "Got it, thanks. Goodbye.",
     inboundGreeting: "Hi, this is Claude. I'm listening.",
-    inboundAck: "Got it, passing it on. Goodbye.",
-    inboundEmpty: "I didn't hear anything. Goodbye.",
     offline: "Claude is offline right now. Goodbye.",
-    hold: "One moment.",
     stillWorking: "Still working on it.",
-    holdTimeout: "This will take longer. I'll call you back when I'm done. Goodbye.",
-    bye: "Goodbye.",
-    savedIntro: (n) => (n === 1 ? "You have one saved message." : `You have ${n} saved messages.`),
-    savedFrom: (project) => `From ${project}:`,
   },
   "pl-PL": {
     voice: "Polly.Ewa",
-    intro: "Cześć, tu Claude.",
-    prompt: "",
-    retry: "Nie dosłyszałem.",
-    noReply: "Nie otrzymałem odpowiedzi. Do usłyszenia.",
-    ack: "Dzięki, przyjąłem. Do usłyszenia.",
     inboundGreeting: "Cześć, tu Claude. Słucham.",
-    inboundAck: "Przyjąłem, przekazuję. Do usłyszenia.",
-    inboundEmpty: "Nic nie usłyszałem. Do usłyszenia.",
     offline: "Claude jest teraz offline. Do usłyszenia.",
-    hold: "Chwileczkę.",
-    stillWorking: "Jeszcze chwila.",
-    holdTimeout: "To potrwa dłużej. Zadzwonię, jak skończę. Do usłyszenia.",
-    bye: "Do usłyszenia.",
-    savedIntro: (n) => (n === 1 ? "Masz jedną zapisaną wiadomość." : `Zapisane wiadomości: ${n}.`),
-    savedFrom: (project) => `Z projektu ${project}:`,
+    stillWorking: "Nadal nad tym pracuję.",
   },
 };
 
@@ -136,81 +114,29 @@ export function normalizeLanguage(x) {
 }
 
 /**
- * Voice + phrases for a call. `requested` (per-call) wins over CALL_ME_LANGUAGE (default, en-US if unset).
- * CALL_ME_VOICE and the CALL_ME_INTRO/REPLY_PROMPT/ACK overrides apply only to the default language.
+ * Language, voice and phrases for a call. `requested` (per-call) wins over CALL_ME_LANGUAGE (default, en-US if unset).
+ * Voice settings and the greeting apply only to calls in the language they were set for (see loadConfig).
  */
 export function speechProfile(cfg, requested) {
   const def = normalizeLanguage(cfg.CALL_ME_LANGUAGE) || "en-US";
   const language = normalizeLanguage(requested) || def;
-  // Seconds of silence that end the user's turn. Twilio's "auto" cut people off at their first pause.
-  const p = { ...LANGUAGES[language], language, speechTimeout: xmlEscape(cfg.CALL_ME_SPEECH_TIMEOUT || "3"), bargeIn: cfg.CALL_ME_BARGE_IN === "1" };
-  // Overrides apply only to calls in the language they were set for (see loadConfig).
+  const p = { ...LANGUAGES[language], language, relayTts: null, relayVoice: null };
   const mine = (k) => cfg[k] !== undefined && (cfg.phraseLanguage?.[k] ?? def) === language;
   if (mine("CALL_ME_VOICE") && cfg.CALL_ME_VOICE) p.voice = cfg.CALL_ME_VOICE;
-  if (mine("CALL_ME_INTRO")) p.intro = cfg.CALL_ME_INTRO;
-  if (mine("CALL_ME_REPLY_PROMPT")) p.prompt = cfg.CALL_ME_REPLY_PROMPT;
-  if (mine("CALL_ME_ACK")) p.ack = cfg.CALL_ME_ACK;
+  if (mine("CALL_ME_RELAY_TTS") && cfg.CALL_ME_RELAY_TTS) p.relayTts = cfg.CALL_ME_RELAY_TTS;
+  if (mine("CALL_ME_RELAY_VOICE") && cfg.CALL_ME_RELAY_VOICE) p.relayVoice = cfg.CALL_ME_RELAY_VOICE;
+  if (mine("CALL_ME_GREETING") && cfg.CALL_ME_GREETING) p.inboundGreeting = cfg.CALL_ME_GREETING;
   return p;
 }
 
-const XML = `<?xml version="1.0" encoding="UTF-8"?>`;
+export const XML = `<?xml version="1.0" encoding="UTF-8"?>`;
 const say = (p, text) =>
   !String(text ?? "").trim()
     ? ""
     : `<Say voice="${xmlEscape(p.voice)}" language="${p.language}">${xmlEscape(text)}</Say>`;
-const gather = (p, url, inner, input = "speech dtmf", onEmpty = false) =>
-  `<Gather input="${input}" action="${xmlEscape(url)}" method="POST" timeout="10" speechTimeout="${p.speechTimeout}" ` +
-  `actionOnEmptyResult="${onEmpty}" language="${p.language}">${inner}</Gather>`;
-
-/** TwiML for the outbound call. If gatherUrl is set, listen for a spoken / keypad reply. */
-export function buildCallTwiml(message, p, gatherUrl) {
-  let x = `${XML}<Response><Pause length="1"/>`;
-  if (p.intro) x += say(p, p.intro);
-  x += say(p, message);
-  if (gatherUrl) {
-    x += gather(p, gatherUrl, say(p, p.prompt));
-    x += gather(p, gatherUrl, say(p, `${p.retry} ${message} ${p.prompt}`.trim()));
-    x += say(p, p.noReply);
-  }
-  return x + `</Response>`;
-}
-
 /** Say something and hang up. */
 export function buildSayHangupTwiml(p, text) {
   return `${XML}<Response>${say(p, text)}<Hangup/></Response>`;
-}
-
-/**
- * Answer an inbound call from the user: first read any saved messages (each in its own language),
- * then record what they say. With saved messages, an empty reply is still posted so the session learns
- * they were heard.
- */
-export function buildInboundTwiml(p, gatherUrl, saved = [], postEmpty = saved.length > 0) {
-  let x = `${XML}<Response>`;
-  if (saved.length) {
-    x += say(p, p.savedIntro(saved.length));
-    for (const m of saved) {
-      const mp = { ...LANGUAGES[m.language], language: m.language, voice: m.language === p.language ? p.voice : LANGUAGES[m.language].voice };
-      x += say(mp, `${mp.savedFrom(m.project)} ${m.message}`) + `<Pause length="1"/>`;
-    }
-  }
-  x += gather(p, gatherUrl, say(p, p.inboundGreeting), "speech", postEmpty);
-  return x + say(p, p.inboundEmpty) + `</Response>`;
-}
-
-/** Live call: keep the user on hold (optionally saying something) and poll waitUrl for Claude's next line. */
-export function buildHoldTwiml(p, waitUrl, text) {
-  return `${XML}<Response>${text ? say(p, text) : ""}<Pause length="2"/><Redirect method="POST">${xmlEscape(waitUrl)}</Redirect></Response>`;
-}
-
-/**
- * Live call: say Claude's line and listen; silence twice posts an empty result.
- * Twilio stops a <Say> inside <Gather> at any sound, including noise, so the line stays outside it
- * and always plays in full unless CALL_ME_BARGE_IN=1.
- */
-export function buildLiveTurnTwiml(p, message, gatherUrl) {
-  const line = p.bargeIn ? gather(p, gatherUrl, say(p, message)) : say(p, message) + gather(p, gatherUrl, "");
-  return `${XML}<Response>${line}${gather(p, gatherUrl, say(p, p.retry), "speech dtmf", true)}</Response>`;
 }
 
 export const REJECT_TWIML = `${XML}<Response><Reject/></Response>`;
@@ -306,16 +232,3 @@ export function takeSaved(dir = STATE_DIR) {
 }
 
 export const dndActive = (now = Date.now(), dir = STATE_DIR) => readState(dir).dndUntil > now;
-
-/**
- * Realtime is the default when it is configured (CALL_ME_REALTIME=1, or a CALL_ME_REALTIME_ENGINE is set and
- * CALL_ME_REALTIME isn't 0) and it can work here: a claude-phone session, and an OpenAI key for the OpenAI voice.
- * One-way notifications (wait_for_reply false) stay plain calls.
- */
-export function realtimeByDefault(cfg, inbound) {
-  const flag = String(cfg.CALL_ME_REALTIME ?? "").trim();
-  const on = flag ? /^(1|true|yes|on)$/i.test(flag) : !!cfg.CALL_ME_REALTIME_ENGINE;
-  if (!on || !inbound) return false;
-  const engine = cfg.CALL_ME_REALTIME_ENGINE || "openai";
-  return engine === "relay" || !!(cfg.OPENAI_API_KEY || process.env.OPENAI_API_KEY);
-}
