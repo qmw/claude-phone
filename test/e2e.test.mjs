@@ -153,9 +153,8 @@ test("inbound: number taken over, strangers rejected, the caller talks with the 
       ["true", "true", "inbound", ME, "laptop", "CAin", "0"],
     );
 
-    // Quiet while Claude works: no filler word.
-    await wait(3000);
-    assert.equal(ws.said.length, 0);
+    // While Claude works: "Chwileczkę." after 2.5 s.
+    await until(() => ws.said.some((m) => m.token === "Chwileczkę."), 4000);
     assert.match(await s.tool("phone_reply", { call_sid: "CAin", message: "Testy przeszły." })(), /^Said/);
     await until(() => ws.said.some((m) => m.token === "Testy przeszły."));
     assert.match(await s.tool("phone_reply", { call_sid: "CAin", message: "Pa!", end_call: true })(), /hangs up/);

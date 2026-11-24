@@ -52,7 +52,7 @@ Just ask: *"run the full test suite and call me with the result"* or *"if you ne
 
 - every sentence you say arrives in the session as a channel event (`live="true"`, `realtime="true"`), with the recent conversation attached;
 - Claude answers with `phone_reply(call_sid, message)`, which the voice says right away. `end_call: true` says the line and hangs up;
-- while Claude works the line stays quiet. After 25 seconds you hear "still working on it", and again every 25 seconds. For long jobs Claude says it will call back, hangs up, and calls you later;
+- while Claude works you hear "one moment" after 2.5 seconds, then "still working on it" after 25 seconds and every 25 seconds after that. For long jobs Claude says it will call back, hangs up, and calls you later;
 - when you hang up, the session gets the transcript.
 
 `wait_for_reply: false` is a one-way notice: the voice says the message and hangs up.
@@ -108,7 +108,7 @@ Each channel event carries `from` (your phone), `to` (the Twilio number you dial
 | `CALL_ME_RELAY_TTS`, `CALL_ME_RELAY_VOICE` | The text-to-speech provider and voice, e.g. `Amazon` + `Ola-Neural` (Polish), `Google` + `pl-PL-Chirp3-HD-Aoede`, `ElevenLabs` + a voice ID. Default: ConversationRelay's voice for the language (ElevenLabs). They apply to the language set in the same config file. ElevenLabs voices stop mid-sentence when you interrupt; Amazon voices finish the sentence first. |
 | `CALL_ME_RELAY_INTERRUPT` | How easily you interrupt the voice: `high` (default), `medium` or `low` |
 | `CALL_ME_RELAY_IGNORE_BACKCHANNEL` | `1` ignores short words like "mhm" while the voice talks. With `low` too, a Polish call needed several attempts before it stopped |
-| `CALL_ME_RELAY_FILLER` | A short word said 2.5 s after you finish a sentence while Claude works, e.g. `Mhm.` Default: none |
+| `CALL_ME_RELAY_FILLER` | What the voice says 2.5 s after you finish a sentence while Claude works (default "One moment." / "Chwileczkę."). Empty turns it off |
 | `CALL_ME_GREETING` | What Claude says when you call in |
 
 Claude can also switch the voice mid-call: `phone_reply(..., voice: "Amazon:Ola-Neural")`.

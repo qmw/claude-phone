@@ -144,7 +144,7 @@ test("relay: TwiML asks for Polish, smart interruptions and our socket", async (
   assert.doesNotMatch(en, /Aoede|ttsProvider/);
 });
 
-test("relay: caller's sentence reaches Claude, quiet while waiting, answer spoken, hang-up", async () => {
+test("relay: caller's sentence reaches Claude, filler while waiting, answer spoken, hang-up", async () => {
   const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
   const out = [], events = [], rest = [];
   const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
@@ -157,12 +157,12 @@ test("relay: caller's sentence reaches Claude, quiet while waiting, answer spoke
   ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Jaka jest wersja pluginu?", last: true }));
   assert.match(events[0].content, /^Jaka jest wersja pluginu\?/);
   assert.equal(events[0].meta.call_sid, "CA9");
-  await new Promise((r) => setTimeout(r, 3000)); // no filler by default
-  assert.equal(out.length, 0);
+  await until(() => out.length === 1, 4000); // filler after 2.5 s
+  assert.equal(out[0].token, "Chwileczkę.");
   assert.match(rc.say("Wersja zero osiem."), /^Said/);
-  assert.deepEqual(out[0], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
+  assert.deepEqual(out[1], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
   await rc.hangup();
-  assert.equal(out[1].type, "end");
+  assert.equal(out[2].type, "end");
   assert.deepEqual(rest[0].slice(1), ["POST", "Calls/CA9.json", { Status: "completed" }]);
   assert.equal(events.length, 1);
 });
@@ -194,11 +194,11 @@ test("ws: a reset connection does not throw", async () => {
   server.close();
 });
 
-test("relay: an optional filler word, and 'still working' after 25 s", async () => {
+test("relay: a configured filler word, and 'still working' after 25 s", async () => {
   const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
   const out = [];
   const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
-  const rc = new RelayCall({ cfg: { CALL_ME_RELAY_FILLER: "Mhm." }, profile: PL, opening: "x", notify() {}, log() {} });
+  const rc = new RelayCall({ cfg: {}, profile: speechProfile({ CALL_ME_LANGUAGE: "pl-PL", CALL_ME_RELAY_FILLER: "Mhm." }),  opening: "x", notify() {}, log() {} });
   rc.attach(ws);
   ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA7" }));
   ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Co tam?", last: true }));
@@ -220,4 +220,17 @@ test("relay: a one-way call tells the session nothing", async () => {
   ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Dzięki", last: true }));
   ws.emit("close");
   assert.equal(events.length, 0);
+});
+
+test("relay: an empty CALL_ME_RELAY_FILLER keeps the line quiet", async () => {
+  const { RelayCall } = await import("../plugins/call-me/server/relay.mjs");
+  const out = [];
+  const ws = Object.assign(new EventEmitter(), { send: (m) => out.push(m), close() {} });
+  const rc = new RelayCall({ cfg: {}, profile: speechProfile({ CALL_ME_LANGUAGE: "pl-PL", CALL_ME_RELAY_FILLER: "" }), opening: "x", notify() {}, log() {} });
+  rc.attach(ws);
+  ws.emit("message", JSON.stringify({ type: "setup", callSid: "CA6" }));
+  ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Co tam?", last: true }));
+  await new Promise((r) => setTimeout(r, 3000));
+  assert.equal(out.length, 0);
+  rc.end("test");
 });

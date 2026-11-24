@@ -44,7 +44,7 @@ const readEnvFile = (file) => {
 
 /** Config = config file < project file < process env < this session's overrides. */
 // A voice belongs to the language in effect where it was set (a Polish voice must not read an English call).
-const PHRASE_KEYS = ["CALL_ME_VOICE", "CALL_ME_RELAY_TTS", "CALL_ME_RELAY_VOICE", "CALL_ME_GREETING"];
+const PHRASE_KEYS = ["CALL_ME_VOICE", "CALL_ME_RELAY_TTS", "CALL_ME_RELAY_VOICE", "CALL_ME_GREETING", "CALL_ME_RELAY_FILLER"];
 
 export function loadConfig(env = process.env, file = CONFIG_PATH, projectFile = null, overrides = {}) {
   const fromEnv = Object.fromEntries(
@@ -92,12 +92,14 @@ export const LANGUAGES = {
     voice: "Polly.Joanna",
     inboundGreeting: "Hi, this is Claude. I'm listening.",
     offline: "Claude is offline right now. Goodbye.",
+    filler: "One moment.",
     stillWorking: "Still working on it.",
   },
   "pl-PL": {
     voice: "Polly.Ewa",
     inboundGreeting: "Cześć, tu Claude. Słucham.",
     offline: "Claude jest teraz offline. Do usłyszenia.",
+    filler: "Chwileczkę.",
     stillWorking: "Nadal nad tym pracuję.",
   },
 };
@@ -126,6 +128,7 @@ export function speechProfile(cfg, requested) {
   if (mine("CALL_ME_RELAY_TTS") && cfg.CALL_ME_RELAY_TTS) p.relayTts = cfg.CALL_ME_RELAY_TTS;
   if (mine("CALL_ME_RELAY_VOICE") && cfg.CALL_ME_RELAY_VOICE) p.relayVoice = cfg.CALL_ME_RELAY_VOICE;
   if (mine("CALL_ME_GREETING") && cfg.CALL_ME_GREETING) p.inboundGreeting = cfg.CALL_ME_GREETING;
+  if (mine("CALL_ME_RELAY_FILLER")) p.filler = cfg.CALL_ME_RELAY_FILLER; // "" turns the filler off
   return p;
 }
 
