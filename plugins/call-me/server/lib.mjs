@@ -92,14 +92,14 @@ export const LANGUAGES = {
     voice: "Polly.Joanna",
     inboundGreeting: "Hi, this is Claude. I'm listening.",
     offline: "Claude is offline right now. Goodbye.",
-    filler: "One moment.",
+    fillers: ["One moment.", "Just a sec.", "Let me see.", "Hang on.", "Okay, one second."],
     stillWorking: "Still working on it.",
   },
   "pl-PL": {
     voice: "Polly.Ewa",
     inboundGreeting: "Cześć, tu Claude. Słucham.",
     offline: "Claude jest teraz offline. Do usłyszenia.",
-    filler: "Chwileczkę.",
+    fillers: ["Chwileczkę.", "Sekundka.", "Moment.", "Już patrzę.", "Dobra, chwilka."],
     stillWorking: "Nadal nad tym pracuję.",
   },
 };
@@ -128,7 +128,8 @@ export function speechProfile(cfg, requested) {
   if (mine("CALL_ME_RELAY_TTS") && cfg.CALL_ME_RELAY_TTS) p.relayTts = cfg.CALL_ME_RELAY_TTS;
   if (mine("CALL_ME_RELAY_VOICE") && cfg.CALL_ME_RELAY_VOICE) p.relayVoice = cfg.CALL_ME_RELAY_VOICE;
   if (mine("CALL_ME_GREETING") && cfg.CALL_ME_GREETING) p.inboundGreeting = cfg.CALL_ME_GREETING;
-  if (mine("CALL_ME_RELAY_FILLER")) p.filler = cfg.CALL_ME_RELAY_FILLER; // "" turns the filler off
+  // "|" separates alternatives; "" turns the filler off.
+  if (mine("CALL_ME_RELAY_FILLER")) p.fillers = String(cfg.CALL_ME_RELAY_FILLER).split("|").map((x) => x.trim()).filter(Boolean);
   return p;
 }
 

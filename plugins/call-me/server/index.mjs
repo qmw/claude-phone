@@ -37,7 +37,7 @@ import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.11.1";
+const VERSION = "0.11.2";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);

@@ -1,7 +1,7 @@
 // Calls through Twilio ConversationRelay: Twilio does the speech recognition (Deepgram) and the voice (ElevenLabs by
 // default, or the configured one), with smart interruptions. Claude in the session is the brain: each finished
 // sentence of the caller arrives as a channel event and phone_reply sends the answer, which Twilio speaks.
-// While Claude works the caller hears a short filler ("Chwileczkę.") after 2.5 s, then "still on it" every 25 s.
+// While Claude works the caller hears a short filler ("Chwileczkę.", "Sekundka." …) after 2.5 s, then "still on it" every 25 s.
 import { xmlEscape } from "./lib.mjs";
 
 /** TwiML that connects the call to our WebSocket through ConversationRelay. */
@@ -95,17 +95,19 @@ export class RelayCall {
   }
 
   /**
-   * Keep the caller company while Claude works: the language's filler after 2.5 s (CALL_ME_RELAY_FILLER changes it,
-   * "" turns it off), then "still on it" after 25 s and every 25 s after that.
+   * Keep the caller company while Claude works: one of the language's fillers after 2.5 s, never the same one twice in a
+   * row (CALL_ME_RELAY_FILLER sets them, "|"-separated; "" turns them off), then "still on it" every 25 s.
    */
   tick() {
     const w = this.waiting;
     if (!w || this.ended) return;
     const now = Date.now();
-    const filler = String(this.profile.filler || "").trim();
-    if (!w.filled && filler && now - w.since > 2500) {
+    const fillers = this.profile.fillers || [];
+    if (!w.filled && fillers.length && now - w.since > 2500) {
       w.filled = true;
-      this.speak(filler, false);
+      const choices = fillers.length > 1 ? fillers.filter((f) => f !== this.lastFiller) : fillers;
+      this.lastFiller = choices[Math.floor(Math.random() * choices.length)];
+      this.speak(this.lastFiller, false);
     } else if (now > w.stillAt) {
       w.stillAt = now + 25000;
       this.speak(this.profile.stillWorking, false);

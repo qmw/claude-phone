@@ -158,7 +158,7 @@ test("relay: caller's sentence reaches Claude, filler while waiting, answer spok
   assert.match(events[0].content, /^Jaka jest wersja pluginu\?/);
   assert.equal(events[0].meta.call_sid, "CA9");
   await until(() => out.length === 1, 4000); // filler after 2.5 s
-  assert.equal(out[0].token, "Chwileczkę.");
+  assert.ok(PL.fillers.includes(out[0].token), out[0].token);
   assert.match(rc.say("Wersja zero osiem."), /^Said/);
   assert.deepEqual(out[1], { type: "text", token: "Wersja zero osiem.", last: true, lang: "pl-PL" });
   await rc.hangup();
@@ -233,4 +233,21 @@ test("relay: an empty CALL_ME_RELAY_FILLER keeps the line quiet", async () => {
   await new Promise((r) => setTimeout(r, 3000));
   assert.equal(out.length, 0);
   rc.end("test");
+});
+
+test("relay: fillers vary, never the same twice in a row; CALL_ME_RELAY_FILLER takes |-separated alternatives", () => {
+  assert.ok(PL.fillers.length >= 4 && PL.fillers.includes("Chwileczkę."));
+  assert.ok(EN.fillers.includes("One moment."));
+  assert.deepEqual(speechProfile({ CALL_ME_LANGUAGE: "pl-PL", CALL_ME_RELAY_FILLER: "Mhm. | Sekunda." }).fillers, ["Mhm.", "Sekunda."]);
+  const said = [];
+  const call = { profile: PL, waiting: null, ended: null, speak: (t) => said.push(t), lastFiller: null };
+  return import("../plugins/call-me/server/relay.mjs").then(({ RelayCall }) => {
+    for (let i = 0; i < 30; i++) {
+      call.waiting = { since: Date.now() - 3000, filled: false, stillAt: Date.now() + 25000 };
+      RelayCall.prototype.tick.call(call);
+    }
+    assert.equal(said.length, 30);
+    for (let i = 1; i < said.length; i++) assert.notEqual(said[i], said[i - 1]);
+    assert.ok(new Set(said).size >= 3);
+  });
 });
