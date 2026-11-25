@@ -37,7 +37,7 @@ import { acceptUpgrade } from "./ws.mjs";
 import { RealtimeCall } from "./realtime.mjs";
 import { RelayCall, relayTwiml } from "./relay.mjs";
 
-const VERSION = "0.11.2";
+const VERSION = "0.11.3";
 const INBOUND = /^(1|true|yes)$/i.test(process.env.CALL_ME_INBOUND || "");
 const NO = /^(0|false|no)$/i;
 const log = (...a) => process.stderr.write(`[call-me] ${a.join(" ")}\n`);
@@ -671,7 +671,8 @@ const CHANNEL_INSTRUCTIONS =
   "transcription errors). Treat them as a request typed by the user. When meta live=\"true\" the user is on the line: " +
   "answer right away with phone_reply(call_sid, ...), which returns at once; their next sentence comes as a new event. " +
   "Answer within seconds; for longer work first say you're on it, then send progress updates and the result, each with phone_reply. " +
-  "A sentence may arrive cut in half when the user pauses: if it looks unfinished, wait for the next event instead of answering. " +
+  "A sentence may arrive cut in half when the user pauses. The caller has already heard a filler (\"one moment\"), so never stay silent: " +
+  "if it looks unfinished, reply with a short prompt to go on (\"Yes?\", \"Mhm, go on.\" in the call's language) and answer once the rest arrives. " +
   "End the call with end_call: true when the user says goodbye. For work that takes more than a few minutes, say you will call back, " +
   "end the call, then use call_me. When live=\"false\" the call has ended and the event carries its transcript. " +
   "Reply in the language the user spoke (meta language).";
